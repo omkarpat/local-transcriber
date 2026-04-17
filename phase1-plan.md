@@ -32,7 +32,7 @@
   - Verified on iPhone 17 Pro simulator: probability cycles 1.0 during speech / <0.02 in silence, state pill cycles through IDLE → LISTENING → SPEAKING → IDLE, utterances close cleanly after ~700ms of silence, WAVs land in Documents, ring-buffer overflow stays at 0.
 - [ ] **Task 4** — Moonshine ASR Integration (in progress)
   - Subtasks carved up as: **4.1** inspect + document (done), **4.1b** ModelAssets + first-run downloader (done), **4.2a** forward pass (done), **4.2b** tokenizer (done), **4.4** VAD→ASR wiring (next), **4.5+4.6** benchmark + error handling.
-  - [x] **4.2b** — swift-transformers tokenizer: IDs → text
+  - [x] **4.2b** — swift-transformers tokenizer (commit `a940b93`)
     - Added `swift-transformers` 1.3.0 SPM dependency (product **Tokenizers** only; Hub and Transformers aren't needed). Added via Xcode's Package Dependencies GUI — no pbxproj hand-editing.
     - `ASR/MoonshineTokenizer.swift` — thin wrapper around `AutoTokenizer.from(modelFolder:)` that points at `ModelAssets.installDirectory(for:)`. Single method `decode(tokenIDs: [Int64], skipSpecialTokens: Bool = true) -> String`. `nonisolated final class @unchecked Sendable` so it can be loaded off the main actor.
     - `Utilities/SmokeTest.swift` — `runMoonshineInference()` is now `async`; loads both model + tokenizer (2.07s on sim, dominated by ORT session init), decodes the token IDs, prints the transcript string alongside the raw IDs and RTF.
