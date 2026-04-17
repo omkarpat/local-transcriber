@@ -1,0 +1,7 @@
+# Only needed to run `python export_model.py`. Not installed in the
+# runtime container — keeps the image slim (torch + transformers alone
+# are ~2 GB). Versions unpinned: optimum is picky about its transformers
+# peer and overconstraining makes resolution fail; take whatever pip
+# resolves at install time.
+torch
+optimum[onnxruntime]
