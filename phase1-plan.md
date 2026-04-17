@@ -90,7 +90,14 @@
       2. First decoder call: `input_ids = [1]`, `use_cache_branch = false`, past KVs as empty `[1,8,0,36]` tensors. Take `argmax(logits[:, -1, :])` → first token.
       3. Loop: feed the new token as `input_ids`, promote last step's `present.*` → `past_key_values.*`, flip `use_cache_branch = true`. Stop on token 2 (EOS) or length 512.
     - Files live in `scratch/moonshine-tiny/` (gitignored). Throwaway inspection script: `scratch/moonshine-tiny/inspect_io.py`.
-- [ ] **Task 5** — Transcription Pipeline Orchestrator
+- [x] **Task 5** — Transcription Pipeline Orchestrator (5.1–5.5 done; 5.6–5.9 previously done in commits `3b905dd` + `41c9a21`)
+  - `Pipeline/TranscriptionPipeline.swift` — Swift `actor` owning a `AudioCaptureManager` + per-session `VADProcessor` plus a long-lived injected `MoonshineTranscriber` + `PunctuationClient`. Exposes `updates: AsyncStream<TranscriptUpdate>` (per-utterance content), `events: AsyncStream<PipelineEvent>` (lifecycle + speech-state), and an optional `debugEvents: AsyncStream<DebugEvent>?` (per-frame VAD probability + utterance counters; nil unless constructed with `debug: true`). `start(configuration:)` / `stop()` are idempotent; VAD errors surface as `PipelineEvent.failed(message)` and auto-stop the pipeline; audio/permission failures throw synchronously from `start`.
+  - `Pipeline/PipelineConfiguration.swift` — `Sendable` struct: `vad: VADConfiguration` + `enableCloudPunctuation: Bool` + `debugDumpUtterances: Bool`. Last one replaces the old unconditional WAV dump — now off by default, the debug view has a toggle that turns it on when the smoke-test buttons need a latest-utterance WAV on disk.
+  - `Pipeline/TranscriptionSession.swift` — value-type accumulator of finalized + punctuated segments with `fullTranscript` computed property; not yet wired into a UI but ready for copy/export in Phase 2.
+  - `Pipeline/PipelineEvent.swift` — `.started` / `.stopped` / `.failed(String)` / `.speechStateChanged(isActive:)`. Kept separate from `TranscriptUpdate` so utterance-scoped content and pipeline-scoped lifecycle stay independent — UIs subscribe to one or both.
+  - `App/AppState.swift` — now constructs a single `TranscriptionPipeline` with `debug: true` once `MoonshineTranscriber` finishes loading; `pipeline` property exposed to views. `resetInstall()` clears it.
+  - `VAD/VADConfiguration.swift` — gained `Equatable` (needed by `PipelineConfiguration: Equatable`; all fields were already trivially equatable).
+  - UI rewire (new `TranscriptionView`, `AudioCaptureDebugView` consuming the pipeline, shared `TranscriptRow.upsert(_:)`) lands in Task 6's commit.
 - [ ] **Task 6** — Minimal Transcription UI
 - [ ] **Task 7** — Physical Device Testing & Battery Profiling
 

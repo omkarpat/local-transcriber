@@ -1,6 +1,6 @@
 import Foundation
 
-struct VADConfiguration: Sendable {
+struct VADConfiguration: Sendable, Equatable {
     /// Silero VAD output ≥ this value is treated as "speech present" in a frame.
     var speechThreshold: Float = 0.5
 

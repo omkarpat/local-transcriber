@@ -27,6 +27,10 @@ final class AppState {
     private(set) var installState: InstallState = .checking
     private(set) var transcriberStatus: TranscriberStatus = .idle
     private(set) var transcriber: MoonshineTranscriber?
+    /// Long-lived pipeline wrapping the shared transcriber + punctuation
+    /// client. Built once `transcriber` becomes non-nil; persists across
+    /// start/stop cycles so its ASR stream stays continuous.
+    private(set) var pipeline: TranscriptionPipeline?
     /// Shared across the app so any view dispatching a finalized
     /// transcript can post it for cloud punctuation. Instantiated in
     /// `init` — config is two strings, no heavy setup.
@@ -93,6 +97,7 @@ final class AppState {
         try? ModelAssets.remove(bundle)
         installState = .checking
         transcriber = nil
+        pipeline = nil
         transcriberStatus = .idle
         startDownload()
     }
@@ -114,8 +119,17 @@ final class AppState {
                     let tokenizer = try await MoonshineTokenizer.load()
                     return MoonshineTranscriber(model: model, tokenizer: tokenizer)
                 }.value
-                self?.transcriber = t
-                self?.transcriberStatus = .ready
+                guard let self else { return }
+                self.transcriber = t
+                // Construct the pipeline with debug: true so the debug
+                // view has its fine-grained event stream available.
+                // Non-debug views simply don't subscribe to it.
+                self.pipeline = TranscriptionPipeline(
+                    transcriber: t,
+                    punctuationClient: self.punctuationClient,
+                    debug: true
+                )
+                self.transcriberStatus = .ready
                 print("[AppState] transcriber ready")
             } catch {
                 self?.transcriberStatus = .failed(error.localizedDescription)
