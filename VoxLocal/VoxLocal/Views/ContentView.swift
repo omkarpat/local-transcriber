@@ -27,7 +27,7 @@ struct ContentView: View {
                     // runs are both expensive I/O that complain loudly when
                     // invoked on the UI thread.
                     Task.detached(priority: .userInitiated) {
-                        SmokeTest.runMoonshineInference()
+                        await SmokeTest.runMoonshineInference()
                     }
                 }
 

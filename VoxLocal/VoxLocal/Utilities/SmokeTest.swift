@@ -30,11 +30,10 @@ nonisolated enum SmokeTest {
     }
 
     /// Run Moonshine Tiny against the most recently captured utterance in
-    /// Documents/. Prints token IDs only (Task 4.2a — tokenizer arrives in
-    /// 4.2b). Expects the user to have recorded at least one utterance via
-    /// the Audio Capture debug screen; the VAD dumps utterance-*.wav files
-    /// into Documents/ and we pick the most recent one.
-    static func runMoonshineInference() {
+    /// Documents/. Loads tokenizer + model, runs greedy decode, prints the
+    /// decoded transcript plus timing info. Expects the user to have
+    /// recorded at least one utterance via the Audio Capture debug screen.
+    static func runMoonshineInference() async {
         do {
             guard let wavURL = WAVReader.mostRecentUtterance() else {
                 print("[MoonshineSmoke] No utterance-*.wav found in Documents. Record one via Audio Capture first.")
@@ -48,7 +47,8 @@ nonisolated enum SmokeTest {
 
             let loadStart = Date()
             let model = try MoonshineModel()
-            print(String(format: "[MoonshineSmoke] loaded model  %.2fs", Date().timeIntervalSince(loadStart)))
+            let tokenizer = try await MoonshineTokenizer.load()
+            print(String(format: "[MoonshineSmoke] loaded model + tokenizer  %.2fs", Date().timeIntervalSince(loadStart)))
 
             let inferStart = Date()
             let tokens = try model.transcribe(samples: samples)
@@ -57,6 +57,8 @@ nonisolated enum SmokeTest {
 
             print("[MoonshineSmoke] generated \(tokens.count) tokens in \(String(format: "%.2fs", inferTime)) (RTF=\(String(format: "%.2f", rtf)))")
             print("[MoonshineSmoke] token IDs: \(tokens)")
+            let text = tokenizer.decode(tokenIDs: tokens)
+            print("[MoonshineSmoke] transcript: \"\(text)\"")
         } catch {
             print("[MoonshineSmoke] Failed: \(error)")
         }
