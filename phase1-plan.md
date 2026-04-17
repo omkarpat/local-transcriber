@@ -23,7 +23,7 @@
   - `Views/AudioCaptureDebugView.swift` + `ContentView.swift` — NavigationStack entry with live level bar, Written/Drained/Overflow counters; debug view drains the ring buffer every 50ms so overflow stays at 0 end-to-end
   - `NSMicrophoneUsageDescription` added via `INFOPLIST_KEY_*` in both Debug and Release build configs (project uses `GENERATE_INFOPLIST_FILE = YES`, no file-based plist)
   - Verified on iPhone 17 Pro simulator: RMS responds to mic, Written grows at 16kHz, Drained tracks it, Overflow stays at 0
-- [x] **Task 3** — Silero VAD Integration
+- [x] **Task 3** — Silero VAD Integration (commit `2919708`)
   - `VAD/VADConfiguration.swift` — thresholds and durations (speech threshold 0.5, min speech 250ms, end-of-speech silence 700ms, pre-speech padding 300ms, max utterance 30s). Uses Swift's `Duration` type with integer sample/frame conversions.
   - `VAD/SileroVADModel.swift` — ONNX wrapper for Silero VAD v5. Manages three persistent tensors: recurrent state `Float32[2,1,128]`, 64-sample context, and Int64 sample rate. Per-call input is `[64 context + 512 new] = 576 samples` at shape `[1, 576]`. CoreML EP on by default, CPU-only fallback available for diagnostics.
   - `Utilities/WAVWriter.swift` — writes Float32 mono samples to 16kHz 16-bit PCM WAV in the app's Documents folder (for offline Moonshine debugging in Task 4).
