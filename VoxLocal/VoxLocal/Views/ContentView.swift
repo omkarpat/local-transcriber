@@ -9,18 +9,17 @@ import SwiftUI
 
 struct ContentView: View {
     var body: some View {
-        VStack(spacing: 20) {
-            Image(systemName: "globe")
-                .imageScale(.large)
-                .foregroundStyle(.tint)
-            Text("Hello, world!")
-
-            Button("Run ONNX Smoke Test") {
-                SmokeTest.runSileroVADLoadTest()
+        NavigationStack {
+            List {
+                NavigationLink("Audio Capture") {
+                    AudioCaptureDebugView()
+                }
+                Button("Run ONNX Smoke Test") {
+                    SmokeTest.runSileroVADLoadTest()
+                }
             }
-            .buttonStyle(.borderedProminent)
+            .navigationTitle("VoxLocal")
         }
-        .padding()
     }
 }
 

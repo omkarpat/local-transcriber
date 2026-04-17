@@ -6,6 +6,44 @@
 
 ---
 
+## Progress
+
+- [x] **Task 1** — Project Scaffolding & ONNX Runtime Setup (commit `d93fe2f`)
+  - Folder structure: `App/`, `Audio/`, `VAD/`, `ASR/`, `Pipeline/`, `Views/`, `Utilities/`
+  - SPM deps: `onnxruntime-swift` 1.24.2, `swift-collections` 1.4.1
+  - `Utilities/OnnxRuntimeSetup.swift` — shared `ORTEnv` singleton + CoreML EP session-options factory
+  - `Utilities/SmokeTest.swift` + bundled `VAD/silero_vad.onnx` (2.3MB)
+  - Smoke test verified on iPhone 17 Pro simulator: session creates, CoreML EP partitions the graph (18/39 nodes accelerated), inputs `[input, state, sr]`, outputs `[output, stateN]`
+  - `CLAUDE.md` at repo root captures Xcode 26 synchronized-group gotcha
+- [x] **Task 2** — Audio Capture Manager
+  - `Audio/AudioFormat.swift` — 16kHz / mono / Float32 constants + `AVAudioFormat` factory
+  - `Audio/CircularAudioBuffer.swift` — lock-free SPSC ring buffer using Swift 6 `Synchronization.Atomic`; drop-oldest overflow with running `overflowSamples` counter; capacity rounded to next power of 2 for mask-based indexing
+  - `Audio/Permissions.swift` — mic permission via `AVAudioApplication.requestRecordPermission()` (iOS 17+ API)
+  - `Audio/AudioCaptureManager.swift` — `AVAudioSession` (`.record` / `.measurement` / `.duckOthers`), `AVAudioEngine` input tap at hardware rate, `AVAudioConverter` to 16kHz mono Float32, writes to ring buffer; exposes `currentRMS` and `framesCaptured` via atomics
+  - `Views/AudioCaptureDebugView.swift` + `ContentView.swift` — NavigationStack entry with live level bar, Written/Drained/Overflow counters; debug view drains the ring buffer every 50ms so overflow stays at 0 end-to-end
+  - `NSMicrophoneUsageDescription` added via `INFOPLIST_KEY_*` in both Debug and Release build configs (project uses `GENERATE_INFOPLIST_FILE = YES`, no file-based plist)
+  - Verified on iPhone 17 Pro simulator: RMS responds to mic, Written grows at 16kHz, Drained tracks it, Overflow stays at 0
+- [ ] **Task 3** — Silero VAD Integration (next up)
+- [ ] **Task 4** — Moonshine ASR Integration
+- [ ] **Task 5** — Transcription Pipeline Orchestrator
+- [ ] **Task 6** — Minimal Transcription UI
+- [ ] **Task 7** — Physical Device Testing & Battery Profiling
+
+### Notes & deviations from plan
+
+- Deployment target is **iOS 26.4** (Xcode 26 default), not iOS 17. Still satisfies "17+" from the architecture doc. Can lower later if broader device support becomes a goal.
+- Swift build uses `SWIFT_APPROACHABLE_CONCURRENCY = YES` + `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`. Means types default to `@MainActor`; background-thread utilities (like `OnnxRuntimeSetup`) must opt out with `nonisolated`.
+- Task 1.6 ("smoke test on physical device") was run on the **simulator** instead of a registered iPhone, because no device has been registered with the Personal Team yet. Simulator run is sufficient to validate the toolchain; physical-device ANE verification is deferred to Task 7.
+- Task 1 used Silero VAD as the smoke-test model (rather than a synthetic one-op model). Rationale: the model is needed for Task 3 anyway, and loading a real recurrent-state model stresses the CoreML EP more realistically than a trivial graph.
+- Task 2 reordered subtasks: 2.4 (permissions) was written before 2.3 (capture manager) so the manager could assume permission was already granted upstream. Plan-defined order was 2.1 → 2.2 → 2.3 → 2.4 → 2.5; actual order was 2.1 → 2.2 → 2.4 → 2.3 → 2.5.
+- Task 2 used Swift 6 stdlib `Synchronization.Atomic<T>` rather than `swift-atomics` SPM or `TPCircularBuffer`. Rationale: iOS 18+ target makes it available, no third-party C dependency, ~80 lines of Swift we fully understand. `Atomic<Float>` doesn't exist, so `rms` is stored as `Atomic<UInt32>` via `Float.bitPattern`.
+- Task 2 tap thread hazard: project default is `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`, so classes are `@MainActor` by default. The `AVAudioEngine` tap closure runs on the real-time audio thread and must not cross to the main actor. Solution: a separate `nonisolated`, `@unchecked Sendable` `AudioTapState` class holds everything the tap touches (converter, ring buffer, RMS atomic, output buffer); the tap closure captures that reference, not the manager's `self`.
+- Task 2 AVAudioSession mode is `.measurement` rather than `.default`. Rationale: `.measurement` disables iOS's default speech-processing chain (AGC, noise suppression) so the VAD / ASR see the raw mic signal.
+- Task 2 format conversion: the hardware mic runs at 48kHz (or the route's native rate); requesting 16kHz on `AVAudioSession.preferredSampleRate` is a hint only and often overridden. The tap is installed at hardware rate, `AVAudioConverter` does the 48→16kHz / stereo→mono conversion per-buffer inside the tap. Pre-allocated output buffer, no allocations in the hot path.
+- Task 2 physical-device testing (permission dialog, real mic routing, battery impact) deferred to Task 7 along with the rest of on-device verification.
+
+---
+
 ## Task Breakdown
 
 ### 1. Project Scaffolding & ONNX Runtime Setup
