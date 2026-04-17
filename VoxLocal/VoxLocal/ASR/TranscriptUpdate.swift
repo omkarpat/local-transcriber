@@ -1,16 +1,18 @@
 import Foundation
 
-/// One ASR result emitted by `MoonshineTranscriber` on its `updates`
-/// stream. `.partial` is a best-guess snapshot while the user is still
-/// speaking; `.finalized` is the authoritative transcript once VAD closes
-/// the utterance; `.failed` surfaces inference errors so the UI can show
-/// them instead of silently dropping.
+/// One result emitted downstream for the UI to render. `.partial` is a
+/// best-guess snapshot while the user is still speaking; `.finalized` is
+/// the authoritative on-device transcript once VAD closes the utterance;
+/// `.punctuated` is the cloud-polished replacement for a finalized row;
+/// `.failed` surfaces inference errors so the UI can show them instead of
+/// silently dropping.
 ///
-/// Partials and the final result for one utterance share a `utteranceID`
-/// so the UI can upsert them into a single row.
+/// All cases share `utteranceID` so the UI can upsert them into a single
+/// row across partial → final → punctuated.
 nonisolated enum TranscriptUpdate: Sendable, Identifiable, Equatable {
     case partial(TranscriptPartial)
     case finalized(TranscriptResult)
+    case punctuated(TranscriptPunctuated)
     case failed(TranscriptFailure)
 
     /// Per-inference ID (unique to each emitted update).
@@ -18,15 +20,18 @@ nonisolated enum TranscriptUpdate: Sendable, Identifiable, Equatable {
         switch self {
         case .partial(let p): return p.id
         case .finalized(let r): return r.id
+        case .punctuated(let p): return p.id
         case .failed(let f): return f.id
         }
     }
 
-    /// Groups partials + final for the same utterance onto one UI row.
+    /// Groups partials + final + punctuated for the same utterance onto
+    /// one UI row.
     var utteranceID: UUID {
         switch self {
         case .partial(let p): return p.utteranceID
         case .finalized(let r): return r.utteranceID
+        case .punctuated(let p): return p.utteranceID
         case .failed(let f): return f.utteranceID
         }
     }
@@ -35,6 +40,7 @@ nonisolated enum TranscriptUpdate: Sendable, Identifiable, Equatable {
         switch self {
         case .partial(let p): return p.utteranceDuration
         case .finalized(let r): return r.utteranceDuration
+        case .punctuated(let p): return p.utteranceDuration
         case .failed(let f): return f.utteranceDuration
         }
     }
@@ -83,4 +89,18 @@ nonisolated struct TranscriptFailure: Sendable, Identifiable, Equatable {
     let utteranceID: UUID
     let utteranceDuration: Duration
     let message: String
+}
+
+/// Server-polished replacement for a finalized transcript. Emitted when
+/// the punctuation service returns a 2xx within the client timeout; the
+/// UI replaces the finalized row's text with `text` in place (keyed by
+/// `utteranceID`). On server failure nothing is emitted — the raw
+/// finalized row stays on screen (silent fallback).
+nonisolated struct TranscriptPunctuated: Sendable, Identifiable, Equatable {
+    let id: UUID
+    let utteranceID: UUID
+    let text: String                   // punctuated + cased
+    let sourceText: String             // raw local text we sent
+    let utteranceDuration: Duration    // carried over from the finalized result
+    let roundTripDuration: Duration    // network wall time, for telemetry
 }

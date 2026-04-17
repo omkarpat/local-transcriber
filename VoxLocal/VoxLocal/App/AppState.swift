@@ -27,14 +27,20 @@ final class AppState {
     private(set) var installState: InstallState = .checking
     private(set) var transcriberStatus: TranscriberStatus = .idle
     private(set) var transcriber: MoonshineTranscriber?
+    /// Shared across the app so any view dispatching a finalized
+    /// transcript can post it for cloud punctuation. Instantiated in
+    /// `init` — config is two strings, no heavy setup.
+    let punctuationClient: PunctuationClient
     let bundle: ModelBundle
     private let downloader: ModelDownloader
     private var currentTask: Task<Void, Never>?
 
     init(bundle: ModelBundle = ModelAssets.moonshineTiny,
-         downloader: ModelDownloader = ModelDownloader()) {
+         downloader: ModelDownloader = ModelDownloader(),
+         punctuationClient: PunctuationClient = PunctuationClient()) {
         self.bundle = bundle
         self.downloader = downloader
+        self.punctuationClient = punctuationClient
     }
 
     /// Decide whether to skip the downloader or kick it off. Idempotent —

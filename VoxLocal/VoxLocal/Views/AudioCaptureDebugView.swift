@@ -32,6 +32,7 @@ final class AudioCaptureDebugModel {
     @ObservationIgnored private var eventTask: Task<Void, Never>?
     @ObservationIgnored private var transcriptTask: Task<Void, Never>?
     @ObservationIgnored private var transcriber: MoonshineTranscriber?
+    @ObservationIgnored private var punctuationClient: PunctuationClient?
     @ObservationIgnored private let log = Logger(subsystem: "com.omkarpatil.VoxLocal", category: "DebugView")
 
     var isRunning = false
@@ -106,11 +107,13 @@ final class AudioCaptureDebugModel {
         }
     }
 
-    /// Bind the preloaded `MoonshineTranscriber` from `AppState` to this
-    /// model's event pipeline. Idempotent — re-calling with the same
-    /// instance is a no-op. The view calls this via `.onChange` as soon
-    /// as `AppState.transcriber` becomes non-nil.
-    func attach(transcriber: MoonshineTranscriber) {
+    /// Bind the preloaded `MoonshineTranscriber` + `PunctuationClient`
+    /// from `AppState` to this model's event pipeline. Idempotent —
+    /// re-calling with the same transcriber instance is a no-op. The
+    /// view calls this via `.onChange` as soon as `AppState.transcriber`
+    /// becomes non-nil.
+    func attach(transcriber: MoonshineTranscriber, punctuationClient: PunctuationClient) {
+        self.punctuationClient = punctuationClient
         guard self.transcriber !== transcriber else { return }
         self.transcriber = transcriber
         subscribeToTranscripts(transcriber)
@@ -124,7 +127,30 @@ final class AudioCaptureDebugModel {
                 await MainActor.run {
                     self.upsert(update)
                 }
+                if case .finalized(let result) = update {
+                    self.dispatchPunctuation(for: result)
+                }
             }
+        }
+    }
+
+    /// Fire the cloud punctuation request in parallel with the raw
+    /// finalized render. Result is either a polished replacement
+    /// (upserted by `utteranceID`) or nil (silent fallback — raw row
+    /// stays on screen unchanged). `Task { … }` (not detached) so the
+    /// closure inherits MainActor; the `await` on `punctuate` hops off
+    /// actor for the network request and comes back to MainActor for
+    /// the upsert.
+    private func dispatchPunctuation(for result: TranscriptResult) {
+        guard let client = punctuationClient else { return }
+        Task { [weak self] in
+            let maybe = await client.punctuate(
+                utteranceID: result.utteranceID,
+                text: result.text,
+                utteranceDuration: result.utteranceDuration
+            )
+            guard let punctuated = maybe else { return }
+            self?.upsert(.punctuated(punctuated))
         }
     }
 
@@ -134,6 +160,11 @@ final class AudioCaptureDebugModel {
     ///   (late partial returning after final), ignore — final wins.
     /// - `.finalized`: replace the row in place, or insert at top if
     ///   no row exists yet (short utterances may skip partials).
+    /// - `.punctuated`: replace the row's text in place, only if the
+    ///   row is currently `.final`. Never inserts; if the finalized
+    ///   upsert hasn't run yet (shouldn't happen — we upsert final
+    ///   synchronously before dispatching punctuation) or the row is
+    ///   already `.failed`, silently drop.
     /// - `.failed`: same as finalized.
     /// Capped at 20 rows.
     @MainActor
@@ -170,6 +201,11 @@ final class AudioCaptureDebugModel {
                 transcripts[idx] = row
             } else {
                 transcripts.insert(row, at: 0)
+            }
+        case .punctuated(let p):
+            guard let idx = existingIndex else { return }
+            if case .final = transcripts[idx].status {
+                transcripts[idx].text = p.text
             }
         case .failed(let f):
             let row = TranscriptRow(
@@ -326,7 +362,7 @@ struct AudioCaptureDebugView: View {
         }
         .onChange(of: appState.transcriberStatus, initial: true) { _, status in
             if status == .ready, let t = appState.transcriber {
-                model.attach(transcriber: t)
+                model.attach(transcriber: t, punctuationClient: appState.punctuationClient)
             }
         }
     }
