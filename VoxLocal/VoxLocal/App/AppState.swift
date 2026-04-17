@@ -13,7 +13,20 @@ final class AppState {
         case failed(String)
     }
 
+    /// Warmup status of the ASR pipeline (Moonshine model + tokenizer).
+    /// Kicked off automatically once `installState` becomes `.ready` so
+    /// the ~2 s CoreML graph setup happens at launch instead of on the
+    /// user's first tap of Start.
+    enum TranscriberStatus: Equatable {
+        case idle        // install not ready yet
+        case loading
+        case ready       // `transcriber` is non-nil
+        case failed(String)
+    }
+
     private(set) var installState: InstallState = .checking
+    private(set) var transcriberStatus: TranscriberStatus = .idle
+    private(set) var transcriber: MoonshineTranscriber?
     let bundle: ModelBundle
     private let downloader: ModelDownloader
     private var currentTask: Task<Void, Never>?
@@ -31,6 +44,7 @@ final class AppState {
         if ModelAssets.isInstalled(bundle) {
             print("[AppState] bundle \(bundle.id) already installed; skipping download")
             installState = .ready
+            loadTranscriber()
             return
         }
         print("[AppState] bundle \(bundle.id) missing; starting download")
@@ -51,6 +65,7 @@ final class AppState {
                     if progress.phase == .allCompleted {
                         print("[AppState] install ready")
                         self?.installState = .ready
+                        self?.loadTranscriber()
                     }
                 }
             } catch is CancellationError {
@@ -71,7 +86,36 @@ final class AppState {
         currentTask = nil
         try? ModelAssets.remove(bundle)
         installState = .checking
+        transcriber = nil
+        transcriberStatus = .idle
         startDownload()
+    }
+
+    /// Load Moonshine + tokenizer off the main actor, exactly once per
+    /// app lifetime. Idempotent — subsequent calls while loading or
+    /// already loaded are no-ops. Downloader → transcriber is the only
+    /// legitimate path; we reset to `.idle` on bundle removal via
+    /// `resetInstall()`.
+    private func loadTranscriber() {
+        guard case .idle = transcriberStatus else { return }
+        transcriberStatus = .loading
+        Task { [weak self] in
+            do {
+                // Detached so ~2 s of file I/O + CoreML graph setup
+                // doesn't block the main actor.
+                let t = try await Task.detached(priority: .userInitiated) { () -> MoonshineTranscriber in
+                    let model = try MoonshineModel()
+                    let tokenizer = try await MoonshineTokenizer.load()
+                    return MoonshineTranscriber(model: model, tokenizer: tokenizer)
+                }.value
+                self?.transcriber = t
+                self?.transcriberStatus = .ready
+                print("[AppState] transcriber ready")
+            } catch {
+                self?.transcriberStatus = .failed(error.localizedDescription)
+                print("[AppState] transcriber load failed: \(error.localizedDescription)")
+            }
+        }
     }
 
     #if DEBUG

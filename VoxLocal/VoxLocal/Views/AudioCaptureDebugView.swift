@@ -35,7 +35,6 @@ final class AudioCaptureDebugModel {
     @ObservationIgnored private let log = Logger(subsystem: "com.omkarpatil.VoxLocal", category: "DebugView")
 
     var isRunning = false
-    var isLoadingModels = false
     var rms: Float = 0
     var probability: Float = 0
     var vadState: DebugVADState = .idle
@@ -61,8 +60,11 @@ final class AudioCaptureDebugModel {
     }
 
     private func start() async {
+        guard transcriber != nil else {
+            errorMessage = "Models are still loading — try again in a moment."
+            return
+        }
         do {
-            try await ensureTranscriber()
             try await manager.start()
             var config = VADConfiguration.default
             config.partialTranscriptionInterval = partialIntervalMs.map { .milliseconds($0) }
@@ -87,9 +89,9 @@ final class AudioCaptureDebugModel {
         vadState = .idle
         probability = 0
         isRunning = false
-        // Keep `transcriber`, `transcriptTask`, and `transcripts` across
-        // start/stop cycles — no point reloading the 2s model every time,
-        // and the user likely wants to keep reading the history.
+        // `transcriber` is owned by AppState and lives for the app
+        // lifetime; `transcripts` stays across start/stop cycles so the
+        // user can keep reading history.
     }
 
     private func subscribe(to events: AsyncStream<VADEvent>) {
@@ -104,21 +106,14 @@ final class AudioCaptureDebugModel {
         }
     }
 
-    private func ensureTranscriber() async throws {
-        if transcriber != nil { return }
-        isLoadingModels = true
-        defer { isLoadingModels = false }
-        // Session loads do ~2s of file I/O + CoreML graph setup. Never on
-        // the main actor — CoreAudio and the ORT runtime both fire "This
-        // method should not be called on the main thread" warnings
-        // otherwise. Task.detached hops to a cooperative background thread.
-        let t = try await Task.detached(priority: .userInitiated) { () -> MoonshineTranscriber in
-            let model = try MoonshineModel()
-            let tokenizer = try await MoonshineTokenizer.load()
-            return MoonshineTranscriber(model: model, tokenizer: tokenizer)
-        }.value
-        transcriber = t
-        subscribeToTranscripts(t)
+    /// Bind the preloaded `MoonshineTranscriber` from `AppState` to this
+    /// model's event pipeline. Idempotent — re-calling with the same
+    /// instance is a no-op. The view calls this via `.onChange` as soon
+    /// as `AppState.transcriber` becomes non-nil.
+    func attach(transcriber: MoonshineTranscriber) {
+        guard self.transcriber !== transcriber else { return }
+        self.transcriber = transcriber
+        subscribeToTranscripts(transcriber)
     }
 
     private func subscribeToTranscripts(_ t: MoonshineTranscriber) {
@@ -236,7 +231,12 @@ final class AudioCaptureDebugModel {
 }
 
 struct AudioCaptureDebugView: View {
+    @Environment(AppState.self) private var appState
     @State private var model = AudioCaptureDebugModel()
+
+    private var isLoadingModels: Bool {
+        appState.transcriberStatus == .loading
+    }
 
     var body: some View {
         @Bindable var model = model
@@ -293,13 +293,17 @@ struct AudioCaptureDebugView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
-                .disabled(model.isLoadingModels)
+                .disabled(isLoadingModels || appState.transcriber == nil)
 
-                if model.isLoadingModels {
+                if isLoadingModels {
                     ProgressView()
                     Text("Loading ASR models…")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                } else if case .failed(let message) = appState.transcriberStatus {
+                    Text("Model load failed: \(message)")
+                        .font(.caption)
+                        .foregroundStyle(.red)
                 }
             }
 
@@ -318,6 +322,11 @@ struct AudioCaptureDebugView: View {
             while !Task.isCancelled {
                 model.refreshCaptureMetrics()
                 try? await Task.sleep(for: .milliseconds(50))
+            }
+        }
+        .onChange(of: appState.transcriberStatus, initial: true) { _, status in
+            if status == .ready, let t = appState.transcriber {
+                model.attach(transcriber: t)
             }
         }
     }
@@ -437,4 +446,5 @@ private struct LevelBar: View {
 
 #Preview {
     AudioCaptureDebugView()
+        .environment(AppState.previewing(.ready))
 }
