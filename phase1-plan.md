@@ -30,7 +30,22 @@
   - `VAD/VADProcessor.swift` — detached `Task` consumer loop that reads 512-sample frames from the `CircularAudioBuffer`, runs `SileroVADModel`, and implements an idle → pendingSpeech → speaking → pendingSilence state machine. Pre-roll buffer holds the last 300ms so word onsets aren't clipped. Events fan out via `AsyncStream<VADEvent>`.
   - `Views/AudioCaptureDebugView.swift` extended — speech probability bar + color-coded state pill (gray/orange/green), utterance count, last utterance duration and filename. Subscribes to the VAD event stream on a `Task`; each `utteranceEnded` event writes a WAV.
   - Verified on iPhone 17 Pro simulator: probability cycles 1.0 during speech / <0.02 in silence, state pill cycles through IDLE → LISTENING → SPEAKING → IDLE, utterances close cleanly after ~700ms of silence, WAVs land in Documents, ring-buffer overflow stays at 0.
-- [ ] **Task 4** — Moonshine ASR Integration (next up)
+- [ ] **Task 4** — Moonshine ASR Integration (in progress)
+  - Subtasks carved up as: **4.1** inspect + document (done), **4.1b** ModelAssets + first-run downloader (new — see deviations), **4.2a** forward pass, **4.2b** tokenizer, **4.4** VAD→ASR wiring, **4.5+4.6** benchmark + error handling.
+  - [x] **4.1** — Moonshine Tiny ONNX inspection (no commit; scratch work only)
+    - Source repo: [`onnx-community/moonshine-tiny-ONNX`](https://huggingface.co/onnx-community/moonshine-tiny-ONNX) — HF-transformers-style layout with tokenizer JSONs at top level and `onnx/` subfolder containing the models. Preferred over `UsefulSensors/moonshine` because tokenizer files live alongside the models.
+    - Variant chosen: **float** (`encoder_model.onnx` 30.9 MB + `decoder_model_merged.onnx` 78.2 MB + tokenizer/config JSONs ~3.9 MB = ~113 MB total). Quantized int8 variant exists at ~28 MB but deferred; correctness baseline first, optimization later.
+    - Decoder pattern: `_merged` unifies the no-cache (first call) and with-past (cached call) decoders via a `use_cache_branch` bool input. One file, standard HF Optimum export format, what swift-transformers expects.
+    - **Encoder I/O**: input `input_values [batch, num_samples]` float32 (raw PCM, 16 kHz — **no mel spectrogram**, which is a Moonshine design point vs. Whisper). Output `last_hidden_state [batch, T, 288]` where `T ≈ floor(floor(floor(num_samples/64 - 127/64)/3)/2) - 1` ≈ num_samples/384 → **~40 encoder frames per second of audio**.
+    - **Decoder I/O (merged, 27 inputs / 25 outputs)**:
+      - `input_ids [batch, dec_seq]` int64; `encoder_hidden_states [batch, enc_seq, 288]` float32; 24 past KV tensors (6 layers × {self-K, self-V, cross-K, cross-V}, each `[batch, 8, past_len, 36]`); `use_cache_branch [1]` bool.
+      - Outputs: `logits [batch, dec_seq, 32768]` + 24 `present.*` KV tensors (shape grows by 1 step for self-attn; cross-attn KV is invariant after first call).
+    - Config facts: `hidden_size = 288`, `vocab_size = 32768`, 6 enc + 6 dec layers, 8 KV heads (no GQA), head dim 36, `bos/decoder_start = 1`, `eos = 2`, `max_position_embeddings = 512`. `preprocessor_config.json` declares only `sampling_rate: 16000` — no mel, no normalization params to replicate.
+    - **Inference loop** (greedy baseline, what 4.2a will implement):
+      1. Run encoder once on the full utterance PCM.
+      2. First decoder call: `input_ids = [1]`, `use_cache_branch = false`, past KVs as empty `[1,8,0,36]` tensors. Take `argmax(logits[:, -1, :])` → first token.
+      3. Loop: feed the new token as `input_ids`, promote last step's `present.*` → `past_key_values.*`, flip `use_cache_branch = true`. Stop on token 2 (EOS) or length 512.
+    - Files live in `scratch/moonshine-tiny/` (gitignored). Throwaway inspection script: `scratch/moonshine-tiny/inspect_io.py`.
 - [ ] **Task 5** — Transcription Pipeline Orchestrator
 - [ ] **Task 6** — Minimal Transcription UI
 - [ ] **Task 7** — Physical Device Testing & Battery Profiling
@@ -51,6 +66,10 @@
 - Task 3 VAD warm-up: the LSTM state is zero on init; first ~6 frames (~200ms) of real speech may produce muted probability even after context fix is in place. Current design relies on the natural human-tap-to-speak delay (>500ms) to warm the model on ambient silence. Explicit init-time warm-up deferred unless Task 7 testing shows onset clipping.
 - Task 3 added `Utilities/WAVWriter.swift` as a debug-only side-channel: each detected utterance is dumped to `Documents/utterance-<ms>.wav`. Purpose is to have a corpus of real captured utterances to feed offline into Moonshine during Task 4 development (so we can iterate on ASR without re-recording each time).
 - Task 3 also added `OnnxRuntimeSetup.makeCPUSessionOptions()` and `SileroVADModel(useCoreML: Bool)` as diagnostic tooling (so we can force CPU-only inference when debugging CoreML EP issues). The normal path still uses CoreML EP.
+- Task 4 scope split: plan-defined Task 4 was a single block. Broken into 4.1 (inspect), 4.1b (**new** — ModelAssets + first-run downloader), 4.2a (forward pass), 4.2b (tokenizer), 4.4 (VAD→ASR wiring), 4.5+4.6 (benchmark + error). Rationale: smaller commits, and inserting 4.1b early means Moonshine ONNX files never get committed to git (Silero VAD at 2.3 MB is fine to commit; Moonshine at ~110 MB would bloat the repo permanently, and removing it later requires destructive history rewrites — especially relevant if we later swap to Whisper).
+- Task 4.1b is **not** in the original plan. Models load from `Library/Application Support/Models/moonshine-tiny/` (with `isExcludedFromBackupKey = true` so they don't inflate iCloud backups). First-run UI kicks off a `URLSession` download from the HF repo. Deferred for simplicity: SHA256 verification, resume-on-failure, retry UI, WiFi-only toggle — add when they start hurting.
+- Task 4.1 deviation from plan 4.1 wording: original says "Moonshine v2 has separate encoder and decoder ONNX files." Reality is the HF Optimum export produces three decoder flavors (no-cache, with-past, merged). We use **`decoder_model_merged.onnx`** — one file that handles both first-call and cached-call via a `use_cache_branch` bool input. Standard pattern, matches what swift-transformers expects.
+- Task 4.1 deviation: plan 4.2 says "Moonshine uses a BPE/SentencePiece tokenizer — either port the tokenizer to Swift or use a lightweight C++ binding." Decision: use [`swift-transformers`](https://github.com/huggingface/swift-transformers) SPM — it reads the `tokenizer.json` directly, one import, no C++. Will be wired in Task 4.2b.
 
 ---
 
