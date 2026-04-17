@@ -32,7 +32,7 @@
   - Verified on iPhone 17 Pro simulator: probability cycles 1.0 during speech / <0.02 in silence, state pill cycles through IDLE → LISTENING → SPEAKING → IDLE, utterances close cleanly after ~700ms of silence, WAVs land in Documents, ring-buffer overflow stays at 0.
 - [x] **Task 4** — Moonshine ASR Integration (complete through subtasks 4.1–4.6; plan.md's 4.3 streaming partials deferred)
   - Subtasks carved up as: **4.1** inspect + document (done), **4.1b** ModelAssets + first-run downloader (done), **4.2a** forward pass (done), **4.2b** tokenizer (done), **4.4** VAD→ASR wiring (done), **4.5+4.6** benchmark + error handling (done). **Task 4 complete.**
-  - [x] **4.5 + 4.6** — Benchmarking and basic error handling
+  - [x] **4.5 + 4.6** — Benchmarking and basic error handling (commit `b7ae70c`)
     - `ASR/MoonshineModel.swift` — `transcribe(samples:)` now returns a `TranscriptionResult { tokens, timings }` where `TranscriptionTimings` records per-phase wall time (encoder, first-decode-call, cache-decode-calls, total) plus a cache-call count. Callers that only needed tokens now read `result.tokens`; all pipeline sites updated.
     - `ASR/TranscriptUpdate.swift` — converted from a struct to an enum with `.finalized(TranscriptResult)` and `.failed(TranscriptFailure)`. `TranscriptResult` carries the decoded text + timings; `TranscriptFailure` carries the error message. Both have UUID IDs and satisfy `Identifiable` via a switch on the enum. Phase 1 ignores partial/streaming results — they're always `.finalized`.
     - `ASR/MoonshineTranscriber.swift` — now emits `.failed(TranscriptFailure)` when inference throws instead of silently dropping + logging. Success path still goes through `.finalized` with the full `TranscriptionTimings` carried through.
