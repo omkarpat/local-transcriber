@@ -29,6 +29,39 @@ nonisolated enum SmokeTest {
         }
     }
 
+    /// Run Moonshine Tiny against the most recently captured utterance in
+    /// Documents/. Prints token IDs only (Task 4.2a — tokenizer arrives in
+    /// 4.2b). Expects the user to have recorded at least one utterance via
+    /// the Audio Capture debug screen; the VAD dumps utterance-*.wav files
+    /// into Documents/ and we pick the most recent one.
+    static func runMoonshineInference() {
+        do {
+            guard let wavURL = WAVReader.mostRecentUtterance() else {
+                print("[MoonshineSmoke] No utterance-*.wav found in Documents. Record one via Audio Capture first.")
+                return
+            }
+            print("[MoonshineSmoke] WAV: \(wavURL.lastPathComponent)")
+
+            let samples = try WAVReader.readFloat32Samples(from: wavURL)
+            let durationMS = Int(Double(samples.count) * 1000.0 / AudioFormat.sampleRate)
+            print("[MoonshineSmoke] samples=\(samples.count)  duration=\(durationMS)ms")
+
+            let loadStart = Date()
+            let model = try MoonshineModel()
+            print(String(format: "[MoonshineSmoke] loaded model  %.2fs", Date().timeIntervalSince(loadStart)))
+
+            let inferStart = Date()
+            let tokens = try model.transcribe(samples: samples)
+            let inferTime = Date().timeIntervalSince(inferStart)
+            let rtf = inferTime / (Double(durationMS) / 1000.0)
+
+            print("[MoonshineSmoke] generated \(tokens.count) tokens in \(String(format: "%.2fs", inferTime)) (RTF=\(String(format: "%.2f", rtf)))")
+            print("[MoonshineSmoke] token IDs: \(tokens)")
+        } catch {
+            print("[MoonshineSmoke] Failed: \(error)")
+        }
+    }
+
     /// Feed the VAD model a few known synthetic signals and print the probability it returns.
     /// If probability varies meaningfully between silence and tone, the model itself is healthy
     /// and any VAD misbehavior is in our audio pipeline. If it stays ~0 on all, the model/export

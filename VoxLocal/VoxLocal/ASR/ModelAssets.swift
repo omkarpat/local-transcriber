@@ -26,6 +26,14 @@ nonisolated enum ModelAssets {
     /// Moonshine Tiny (float variant) sourced from onnx-community/moonshine-tiny-ONNX
     /// on Hugging Face. Byte sizes captured 2026-04-16; bump if the HF repo
     /// updates. See `phase1-plan.md` Task 4.1 for the full I/O spec.
+    ///
+    /// We intentionally use the **split** decoder pair (decoder_model +
+    /// decoder_with_past_model) rather than `decoder_model_merged.onnx`.
+    /// The merged variant requires a bool `use_cache_branch` input, but the
+    /// Objective-C ONNX Runtime binding used by this package does not
+    /// expose a BOOL tensor element type. Using the split pair is ~66 MB
+    /// larger on disk but keeps the inference path pure Swift. See
+    /// phase1-plan.md Task 4.2a notes.
     static let moonshineTiny: ModelBundle = {
         let base = "https://huggingface.co/onnx-community/moonshine-tiny-ONNX/resolve/main"
         return ModelBundle(
@@ -35,9 +43,12 @@ nonisolated enum ModelAssets {
                 RemoteFile(relativePath: "encoder_model.onnx",
                            sourceURL: URL(string: "\(base)/onnx/encoder_model.onnx")!,
                            expectedBytes: 30_882_331),
-                RemoteFile(relativePath: "decoder_model_merged.onnx",
-                           sourceURL: URL(string: "\(base)/onnx/decoder_model_merged.onnx")!,
-                           expectedBytes: 78_227_550),
+                RemoteFile(relativePath: "decoder_model.onnx",
+                           sourceURL: URL(string: "\(base)/onnx/decoder_model.onnx")!,
+                           expectedBytes: 77_906_761),
+                RemoteFile(relativePath: "decoder_with_past_model.onnx",
+                           sourceURL: URL(string: "\(base)/onnx/decoder_with_past_model.onnx")!,
+                           expectedBytes: 73_867_894),
                 RemoteFile(relativePath: "tokenizer.json",
                            sourceURL: URL(string: "\(base)/tokenizer.json")!,
                            expectedBytes: 3_761_754),

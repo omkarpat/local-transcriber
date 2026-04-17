@@ -22,6 +22,14 @@ struct ContentView: View {
                 Button("Run VAD Sanity Inference") {
                     SmokeTest.runSileroVADInferenceSanity()
                 }
+                Button("Run Moonshine on latest utterance") {
+                    // Dispatch off the main actor — AVAudioFile and ORT session
+                    // runs are both expensive I/O that complain loudly when
+                    // invoked on the UI thread.
+                    Task.detached(priority: .userInitiated) {
+                        SmokeTest.runMoonshineInference()
+                    }
+                }
 
                 Section("Developer") {
                     Button(role: .destructive) {
