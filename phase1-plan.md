@@ -32,7 +32,7 @@
   - Verified on iPhone 17 Pro simulator: probability cycles 1.0 during speech / <0.02 in silence, state pill cycles through IDLE → LISTENING → SPEAKING → IDLE, utterances close cleanly after ~700ms of silence, WAVs land in Documents, ring-buffer overflow stays at 0.
 - [ ] **Task 4** — Moonshine ASR Integration (in progress)
   - Subtasks carved up as: **4.1** inspect + document (done), **4.1b** ModelAssets + first-run downloader (done), **4.2a** forward pass (done), **4.2b** tokenizer (done), **4.4** VAD→ASR wiring (done), **4.5+4.6** benchmark + error handling (next).
-  - [x] **4.4** — MoonshineTranscriber consuming VAD events
+  - [x] **4.4** — MoonshineTranscriber consuming VAD events (commit `631215d`)
     - `ASR/TranscriptUpdate.swift` — Sendable value type with `id`, `text`, `utteranceDuration`, `inferenceDuration`, `tokenCount`; computed `realTimeFactor` for UI display.
     - `ASR/MoonshineTranscriber.swift` — `nonisolated final class @unchecked Sendable` holding a pre-loaded MoonshineModel + MoonshineTokenizer. Push-based `enqueue(samples:duration:)` spawns a `Task.detached` per utterance (parallel transcription; RTF << 1 means back-to-back utterances don't queue up under normal speech cadence). Emits completed results via `AsyncStream<TranscriptUpdate>`.
     - `Views/AudioCaptureDebugView.swift` — `AudioCaptureDebugModel` now loads model + tokenizer once on first Start (spinner shown via `isLoadingModels`). Loading is wrapped in `Task.detached` so the ~2s ORT session init doesn't block MainActor. On `utteranceEnded`, the debug model both dumps a WAV (preserved for offline iteration) AND calls `transcriber.enqueue(...)`. Subscribes to `transcriber.updates` and shows a scrolling transcript list (newest first, capped at 20).
