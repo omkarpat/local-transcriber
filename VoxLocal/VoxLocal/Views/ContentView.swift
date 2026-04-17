@@ -12,10 +12,35 @@ struct ContentView: View {
 
     var body: some View {
         NavigationStack {
-            List {
-                NavigationLink("Audio Capture") {
+            TranscriptionView()
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) {
+                        NavigationLink {
+                            DeveloperView()
+                        } label: {
+                            Image(systemName: "hammer")
+                        }
+                    }
+                }
+        }
+    }
+}
+
+/// Secondary menu for developer-only utilities: the VAD/ASR debug
+/// inspector plus the smoke-test + benchmark buttons. Not intended for
+/// end users; reachable via the hammer icon on the main screen.
+struct DeveloperView: View {
+    @Environment(AppState.self) private var appState
+
+    var body: some View {
+        List {
+            Section("Inspector") {
+                NavigationLink("Audio + VAD Debug View") {
                     AudioCaptureDebugView()
                 }
+            }
+
+            Section("Smoke Tests") {
                 Button("Run ONNX Smoke Test") {
                     SmokeTest.runSileroVADLoadTest()
                 }
@@ -35,20 +60,22 @@ struct ContentView: View {
                         await SmokeTest.runMoonshineBenchmark()
                     }
                 }
+            }
 
-                Section("Developer") {
-                    Button(role: .destructive) {
-                        appState.resetInstall()
-                    } label: {
-                        Text("Reinstall Models")
-                    }
+            Section("Install") {
+                Button(role: .destructive) {
+                    appState.resetInstall()
+                } label: {
+                    Text("Reinstall Models")
                 }
             }
-            .navigationTitle("VoxLocal")
         }
+        .navigationTitle("Developer")
+        .navigationBarTitleDisplayMode(.inline)
     }
 }
 
 #Preview {
     ContentView()
+        .environment(AppState.previewing(.ready))
 }

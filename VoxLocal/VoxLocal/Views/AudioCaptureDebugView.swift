@@ -7,32 +7,19 @@ enum DebugVADState: String {
     case speaking = "speaking"
 }
 
-/// UI row for one utterance. `id == utteranceID` so SwiftUI's `ForEach`
-/// updates the existing row in place when a partial is replaced by the
-/// final result.
-struct TranscriptRow: Identifiable, Equatable {
-    enum Status: Equatable {
-        case partial
-        case final(tokenCount: Int, realTimeFactor: Double)
-        case failed(message: String)
-    }
-
-    let utteranceID: UUID
-    var id: UUID { utteranceID }
-    var status: Status
-    var text: String
-    var utteranceDuration: Duration
-    var inferenceDuration: Duration
-}
-
+/// Developer-facing inspector for the pipeline. Subscribes to the same
+/// `TranscriptionPipeline` instance as the user-facing `TranscriptionView`
+/// but also taps into the optional `debugEvents` stream for per-frame VAD
+/// probability + in-flight counters. No wiring of its own — all audio/VAD/
+/// ASR lifecycle goes through the shared actor.
 @Observable
+@MainActor
 final class AudioCaptureDebugModel {
-    let manager = AudioCaptureManager()
-    @ObservationIgnored private var vad: VADProcessor?
-    @ObservationIgnored private var eventTask: Task<Void, Never>?
-    @ObservationIgnored private var transcriptTask: Task<Void, Never>?
-    @ObservationIgnored private var transcriber: MoonshineTranscriber?
-    @ObservationIgnored private var punctuationClient: PunctuationClient?
+    @ObservationIgnored private weak var pipeline: TranscriptionPipeline?
+    @ObservationIgnored private var updatesTask: Task<Void, Never>?
+    @ObservationIgnored private var eventsTask: Task<Void, Never>?
+    @ObservationIgnored private var debugTask: Task<Void, Never>?
+    @ObservationIgnored private var metricsTask: Task<Void, Never>?
     @ObservationIgnored private let log = Logger(subsystem: "com.omkarpatil.VoxLocal", category: "DebugView")
 
     var isRunning = false
@@ -43,226 +30,146 @@ final class AudioCaptureDebugModel {
     var overflowSamples: Int = 0
     var utteranceCount: Int = 0
     var lastUtteranceDuration: Duration = .zero
-    var lastUtterancePath: String?
     var errorMessage: String?
     var transcripts: [TranscriptRow] = []   // most recent first; partials upsert in place
 
-    /// Partial-transcription tick interval in ms. `nil` means partials
-    /// are off (behavior matches pre-partial builds). Applied on
-    /// `.start()`; changing while running requires stop→start.
+    /// Partial-transcription tick interval in ms. `nil` means partials are
+    /// off (behavior matches pre-partial builds). Applied on `.start()`;
+    /// changing while running requires stop→start.
     var partialIntervalMs: Int? = 1500
 
+    /// When false, the pipeline won't POST finalized text to the cloud
+    /// punctuation server on this session. Useful for isolating local-only
+    /// behavior while iterating on VAD / ASR.
+    var cloudPunctuationEnabled: Bool = true
+
+    /// When true, each finalized utterance is also written to
+    /// `Documents/utterance-<ms>.wav` so the "Run Moonshine on latest
+    /// utterance" smoke test has something to replay.
+    var dumpUtteranceWAV: Bool = false
+
+    func attach(to pipeline: TranscriptionPipeline) {
+        guard self.pipeline !== pipeline else { return }
+        self.pipeline = pipeline
+        subscribeToUpdates(pipeline)
+        subscribeToEvents(pipeline)
+        subscribeToDebugEvents(pipeline)
+    }
+
+    func detach() {
+        updatesTask?.cancel(); updatesTask = nil
+        eventsTask?.cancel(); eventsTask = nil
+        debugTask?.cancel(); debugTask = nil
+        metricsTask?.cancel(); metricsTask = nil
+    }
+
     func toggle() async {
-        if isRunning {
-            stop()
-            return
-        }
-        await start()
+        if isRunning { await stop() } else { await start() }
     }
 
     private func start() async {
-        guard transcriber != nil else {
+        guard let pipeline else {
             errorMessage = "Models are still loading — try again in a moment."
             return
         }
+        var config = PipelineConfiguration.default
+        config.vad.partialTranscriptionInterval = partialIntervalMs.map { .milliseconds($0) }
+        config.enableCloudPunctuation = cloudPunctuationEnabled
+        config.debugDumpUtterances = dumpUtteranceWAV
         do {
-            try await manager.start()
-            var config = VADConfiguration.default
-            config.partialTranscriptionInterval = partialIntervalMs.map { .milliseconds($0) }
-            let vad = VADProcessor(ringBuffer: manager.ringBuffer, configuration: config)
-            self.vad = vad
-            subscribe(to: vad.events)
-            vad.start()
-            isRunning = true
+            try await pipeline.start(configuration: config)
+            startMetricsLoop()
             errorMessage = nil
         } catch {
             errorMessage = String(describing: error)
-            isRunning = false
         }
     }
 
-    private func stop() {
-        vad?.stop()
-        vad = nil
-        eventTask?.cancel()
-        eventTask = nil
-        manager.stop()
-        vadState = .idle
-        probability = 0
-        isRunning = false
-        // `transcriber` is owned by AppState and lives for the app
-        // lifetime; `transcripts` stays across start/stop cycles so the
-        // user can keep reading history.
+    private func stop() async {
+        guard let pipeline else { return }
+        await pipeline.stop()
+        metricsTask?.cancel(); metricsTask = nil
     }
 
-    private func subscribe(to events: AsyncStream<VADEvent>) {
-        eventTask?.cancel()
-        eventTask = Task { [weak self] in
-            for await event in events {
+    private func subscribeToUpdates(_ pipeline: TranscriptionPipeline) {
+        updatesTask?.cancel()
+        let stream = pipeline.updates
+        updatesTask = Task { [weak self] in
+            for await update in stream {
                 guard let self else { return }
-                await MainActor.run {
-                    self.apply(event)
+                self.transcripts.upsert(update)
+                if self.transcripts.count > 20 {
+                    self.transcripts.removeLast(self.transcripts.count - 20)
                 }
             }
         }
     }
 
-    /// Bind the preloaded `MoonshineTranscriber` + `PunctuationClient`
-    /// from `AppState` to this model's event pipeline. Idempotent —
-    /// re-calling with the same transcriber instance is a no-op. The
-    /// view calls this via `.onChange` as soon as `AppState.transcriber`
-    /// becomes non-nil.
-    func attach(transcriber: MoonshineTranscriber, punctuationClient: PunctuationClient) {
-        self.punctuationClient = punctuationClient
-        guard self.transcriber !== transcriber else { return }
-        self.transcriber = transcriber
-        subscribeToTranscripts(transcriber)
-    }
-
-    private func subscribeToTranscripts(_ t: MoonshineTranscriber) {
-        transcriptTask?.cancel()
-        transcriptTask = Task { [weak self] in
-            for await update in t.updates {
+    private func subscribeToEvents(_ pipeline: TranscriptionPipeline) {
+        eventsTask?.cancel()
+        let stream = pipeline.events
+        eventsTask = Task { [weak self] in
+            for await event in stream {
                 guard let self else { return }
-                await MainActor.run {
-                    self.upsert(update)
+                switch event {
+                case .started:
+                    self.isRunning = true
+                    self.vadState = .idle
+                    self.errorMessage = nil
+                case .stopped:
+                    self.isRunning = false
+                    self.vadState = .idle
+                    self.probability = 0
+                case .failed(let message):
+                    self.errorMessage = message
+                    self.isRunning = false
+                case .speechStateChanged:
+                    break  // finer-grained info comes from debugEvents below
                 }
-                if case .finalized(let result) = update {
-                    self.dispatchPunctuation(for: result)
+            }
+        }
+    }
+
+    private func subscribeToDebugEvents(_ pipeline: TranscriptionPipeline) {
+        guard let stream = pipeline.debugEvents else {
+            log.warning("pipeline has no debug stream; build AppState with debug: true")
+            return
+        }
+        debugTask?.cancel()
+        debugTask = Task { [weak self] in
+            for await event in stream {
+                guard let self else { return }
+                switch event {
+                case .frame(let probability, let isSpeech):
+                    self.probability = probability
+                    if self.vadState == .idle && isSpeech { self.vadState = .listening }
+                case .utteranceStarted:
+                    self.vadState = .speaking
+                case .utteranceEnded(_, let duration):
+                    self.vadState = .idle
+                    self.utteranceCount += 1
+                    self.lastUtteranceDuration = duration
                 }
             }
         }
     }
 
-    /// Fire the cloud punctuation request in parallel with the raw
-    /// finalized render. Result is either a polished replacement
-    /// (upserted by `utteranceID`) or nil (silent fallback — raw row
-    /// stays on screen unchanged). `Task { … }` (not detached) so the
-    /// closure inherits MainActor; the `await` on `punctuate` hops off
-    /// actor for the network request and comes back to MainActor for
-    /// the upsert.
-    private func dispatchPunctuation(for result: TranscriptResult) {
-        guard let client = punctuationClient else { return }
-        Task { [weak self] in
-            let maybe = await client.punctuate(
-                utteranceID: result.utteranceID,
-                text: result.text,
-                utteranceDuration: result.utteranceDuration
-            )
-            guard let punctuated = maybe else { return }
-            self?.upsert(.punctuated(punctuated))
-        }
-    }
-
-    /// Inserts or updates the row for `update.utteranceID`. Rules:
-    /// - `.partial`: create a new row at top, or replace an existing
-    ///   `.partial` in place. If the row is already `.final`/`.failed`
-    ///   (late partial returning after final), ignore — final wins.
-    /// - `.finalized`: replace the row in place, or insert at top if
-    ///   no row exists yet (short utterances may skip partials).
-    /// - `.punctuated`: replace the row's text in place, only if the
-    ///   row is currently `.final`. Never inserts; if the finalized
-    ///   upsert hasn't run yet (shouldn't happen — we upsert final
-    ///   synchronously before dispatching punctuation) or the row is
-    ///   already `.failed`, silently drop.
-    /// - `.failed`: same as finalized.
-    /// Capped at 20 rows.
-    @MainActor
-    private func upsert(_ update: TranscriptUpdate) {
-        let utteranceID = update.utteranceID
-        let existingIndex = transcripts.firstIndex(where: { $0.utteranceID == utteranceID })
-        switch update {
-        case .partial(let p):
-            if let idx = existingIndex {
-                if case .partial = transcripts[idx].status {
-                    transcripts[idx].text = p.text
-                    transcripts[idx].utteranceDuration = p.utteranceDuration
-                    transcripts[idx].inferenceDuration = p.inferenceDuration
-                }
-                // final / failed rows ignore late partials
-            } else {
-                transcripts.insert(TranscriptRow(
-                    utteranceID: utteranceID,
-                    status: .partial,
-                    text: p.text,
-                    utteranceDuration: p.utteranceDuration,
-                    inferenceDuration: p.inferenceDuration
-                ), at: 0)
-            }
-        case .finalized(let r):
-            let row = TranscriptRow(
-                utteranceID: utteranceID,
-                status: .final(tokenCount: r.tokenCount, realTimeFactor: r.realTimeFactor),
-                text: r.text,
-                utteranceDuration: r.utteranceDuration,
-                inferenceDuration: r.inferenceDuration
-            )
-            if let idx = existingIndex {
-                transcripts[idx] = row
-            } else {
-                transcripts.insert(row, at: 0)
-            }
-        case .punctuated(let p):
-            guard let idx = existingIndex else { return }
-            if case .final = transcripts[idx].status {
-                transcripts[idx].text = p.text
-            }
-        case .failed(let f):
-            let row = TranscriptRow(
-                utteranceID: utteranceID,
-                status: .failed(message: f.message),
-                text: "",
-                utteranceDuration: f.utteranceDuration,
-                inferenceDuration: .zero
-            )
-            if let idx = existingIndex {
-                transcripts[idx] = row
-            } else {
-                transcripts.insert(row, at: 0)
+    private func startMetricsLoop() {
+        metricsTask?.cancel()
+        guard let pipeline else { return }
+        metricsTask = Task { [weak self] in
+            while !Task.isCancelled {
+                let (rms, frames, overflow) = await (
+                    pipeline.currentRMS,
+                    pipeline.framesCaptured,
+                    pipeline.overflowSamples
+                )
+                self?.rms = rms
+                self?.framesCaptured = frames
+                self?.overflowSamples = overflow
+                try? await Task.sleep(for: .milliseconds(50))
             }
         }
-        if transcripts.count > 20 {
-            transcripts.removeLast(transcripts.count - 20)
-        }
-    }
-
-    @MainActor
-    private func apply(_ event: VADEvent) {
-        switch event {
-        case .frame(let prob, let isSpeech):
-            probability = prob
-            if vadState == .idle && isSpeech { vadState = .listening }
-        case .utteranceStarted(_):
-            vadState = .speaking
-        case .utteranceProgress(let id, let samples, let duration):
-            transcriber?.enqueuePartial(utteranceID: id, samples: samples, duration: duration)
-        case .utteranceEnded(let id, let samples, let duration):
-            vadState = .idle
-            utteranceCount += 1
-            lastUtteranceDuration = duration
-            dumpUtterance(samples: samples)
-            transcriber?.enqueue(utteranceID: id, samples: samples, duration: duration)
-        case .error(let message):
-            errorMessage = message
-        }
-    }
-
-    private func dumpUtterance(samples: [Float]) {
-        let stamp = Int(Date().timeIntervalSince1970 * 1000)
-        let url = WAVWriter.documentsDirectory().appendingPathComponent("utterance-\(stamp).wav")
-        do {
-            try WAVWriter.write(samples: samples, to: url)
-            lastUtterancePath = url.lastPathComponent
-            log.info("Wrote utterance: \(url.path)")
-        } catch {
-            log.error("WAV write failed: \(error)")
-        }
-    }
-
-    func refreshCaptureMetrics() {
-        rms = manager.currentRMS
-        framesCaptured = manager.framesCaptured
-        overflowSamples = manager.ringBuffer.overflowSamples
     }
 }
 
@@ -301,7 +208,6 @@ struct AudioCaptureDebugView: View {
             VStack(alignment: .leading, spacing: 6) {
                 metricRow("Utterances", value: "\(model.utteranceCount)")
                 metricRow("Last duration", value: format(duration: model.lastUtteranceDuration))
-                metricRow("Last file", value: model.lastUtterancePath ?? "—")
                 metricRow("Captured (s)", value: String(format: "%.1f", Double(model.framesCaptured) / AudioFormat.sampleRate))
                 metricRow("Overflow", value: "\(model.overflowSamples)")
             }
@@ -323,13 +229,23 @@ struct AudioCaptureDebugView: View {
             }
             .padding(.horizontal)
 
+            VStack {
+                Toggle("Cloud punctuation", isOn: $model.cloudPunctuationEnabled)
+                    .font(.caption)
+                    .disabled(model.isRunning)
+                Toggle("Dump utterance WAV (for smoke tests)", isOn: $model.dumpUtteranceWAV)
+                    .font(.caption)
+                    .disabled(model.isRunning)
+            }
+            .padding(.horizontal)
+
             HStack(spacing: 12) {
                 Button(model.isRunning ? "Stop" : "Start") {
                     Task { await model.toggle() }
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
-                .disabled(isLoadingModels || appState.transcriber == nil)
+                .disabled(isLoadingModels || appState.pipeline == nil)
 
                 if isLoadingModels {
                     ProgressView()
@@ -354,17 +270,12 @@ struct AudioCaptureDebugView: View {
             transcriptList
         }
         .padding()
-        .task {
-            while !Task.isCancelled {
-                model.refreshCaptureMetrics()
-                try? await Task.sleep(for: .milliseconds(50))
-            }
-        }
         .onChange(of: appState.transcriberStatus, initial: true) { _, status in
-            if status == .ready, let t = appState.transcriber {
-                model.attach(transcriber: t, punctuationClient: appState.punctuationClient)
+            if status == .ready, let pipeline = appState.pipeline {
+                model.attach(to: pipeline)
             }
         }
+        .onDisappear { model.detach() }
     }
 
     @ViewBuilder
@@ -405,11 +316,11 @@ struct AudioCaptureDebugView: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
-        case .final(let tokenCount, let rtf):
+        case .final(let tokenCount, let rtf, let punctuated):
             VStack(alignment: .leading, spacing: 2) {
                 Text(row.text.isEmpty ? "(empty)" : row.text)
                     .font(.body)
-                Text("\(format(duration: row.utteranceDuration))  ·  \(String(format: "RTF %.2f", rtf))  ·  \(tokenCount) tok")
+                Text("\(format(duration: row.utteranceDuration))  ·  \(String(format: "RTF %.2f", rtf))  ·  \(tokenCount) tok  ·  \(punctuated ? "punctuated" : "raw")")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
