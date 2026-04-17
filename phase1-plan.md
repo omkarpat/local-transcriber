@@ -32,7 +32,7 @@
   - Verified on iPhone 17 Pro simulator: probability cycles 1.0 during speech / <0.02 in silence, state pill cycles through IDLE → LISTENING → SPEAKING → IDLE, utterances close cleanly after ~700ms of silence, WAVs land in Documents, ring-buffer overflow stays at 0.
 - [ ] **Task 4** — Moonshine ASR Integration (in progress)
   - Subtasks carved up as: **4.1** inspect + document (done), **4.1b** ModelAssets + first-run downloader (new — see deviations), **4.2a** forward pass, **4.2b** tokenizer, **4.4** VAD→ASR wiring, **4.5+4.6** benchmark + error handling.
-  - [x] **4.1** — Moonshine Tiny ONNX inspection (no commit; scratch work only)
+  - [x] **4.1** — Moonshine Tiny ONNX inspection (commit `fa8de68`)
     - Source repo: [`onnx-community/moonshine-tiny-ONNX`](https://huggingface.co/onnx-community/moonshine-tiny-ONNX) — HF-transformers-style layout with tokenizer JSONs at top level and `onnx/` subfolder containing the models. Preferred over `UsefulSensors/moonshine` because tokenizer files live alongside the models.
     - Variant chosen: **float** (`encoder_model.onnx` 30.9 MB + `decoder_model_merged.onnx` 78.2 MB + tokenizer/config JSONs ~3.9 MB = ~113 MB total). Quantized int8 variant exists at ~28 MB but deferred; correctness baseline first, optimization later.
     - Decoder pattern: `_merged` unifies the no-cache (first call) and with-past (cached call) decoders via a `use_cache_branch` bool input. One file, standard HF Optimum export format, what swift-transformers expects.
