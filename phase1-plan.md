@@ -1,0 +1,249 @@
+# Phase 1: Core Local Pipeline — Detailed Task Plan
+
+**Goal**: Mic → VAD → ASR → text on screen, fully on-device.
+**Timeline**: Weeks 1–4 (~80–100 dev hours)
+**Exit Criteria**: User can record speech and see raw (unpunctuated) transcript appear in real-time, fully offline, on an iPhone.
+
+---
+
+## Task Breakdown
+
+### 1. Project Scaffolding & ONNX Runtime Setup
+
+| Field | Detail |
+|---|---|
+| **Estimate** | 1–2 days |
+| **Dependencies** | None (starting point) |
+| **Risk** | 🟡 Medium — ONNX Runtime Swift package can have version/compatibility issues with Xcode |
+
+**Subtasks**:
+
+- **1.1** Create Xcode project (iOS 17+, Swift 6 strict concurrency, SwiftUI lifecycle)
+- **1.2** Add `onnxruntime-swift` SPM dependency; verify it builds for both simulator and physical device
+- **1.3** Add `swift-collections` SPM dependency (for `Deque`-based audio buffering)
+- **1.4** Set up project folder structure matching the architecture doc (`Audio/`, `VAD/`, `ASR/`, `Pipeline/`, `Views/`, `Utilities/`)
+- **1.5** Create `OnnxRuntimeSetup.swift` — shared `OrtEnvironment` singleton with CoreML execution provider configuration
+- **1.6** Verify a trivial ONNX model loads and runs inference on a physical device (smoke test for the full toolchain)
+
+**Acceptance Criteria**: Project builds on simulator + device. ONNX Runtime initializes successfully with CoreML EP enabled. Folder structure in place.
+
+---
+
+### 2. Audio Capture Manager
+
+| Field | Detail |
+|---|---|
+| **Estimate** | 2–3 days |
+| **Dependencies** | Task 1 (project scaffolding) |
+| **Risk** | 🟢 Low — AVAudioEngine is well-documented; main risk is threading discipline |
+
+**Subtasks**:
+
+- **2.1** Create `AudioFormat.swift` — constants: 16kHz sample rate, mono, Float32 PCM
+- **2.2** Implement `CircularAudioBuffer.swift` — lock-free ring buffer for passing audio from the real-time audio thread to processing threads. Consider using `TPCircularBuffer` or a custom implementation with `OSAtomicFifoEnqueue`/`Dequeue`
+- **2.3** Implement `AudioCaptureManager.swift`:
+  - Configure `AVAudioSession` (category: `.record`, mode: `.default`)
+  - Set up `AVAudioEngine` input node
+  - Install tap at 16kHz mono Float32
+  - Write captured frames into the `CircularAudioBuffer`
+  - Expose start/stop methods
+- **2.4** Implement `Permissions.swift` — microphone permission request flow with proper SwiftUI integration (pre-prompt explanation → system dialog → handle denial gracefully)
+- **2.5** Build a minimal debug view that shows audio is being captured (e.g., display RMS level or frame count updating in real-time)
+
+**Acceptance Criteria**: App requests mic permission, captures audio at 16kHz/mono/Float32, writes to ring buffer without audio thread glitches. Debug view confirms audio is flowing.
+
+---
+
+### 3. Silero VAD Integration
+
+| Field | Detail |
+|---|---|
+| **Estimate** | 3–4 days |
+| **Dependencies** | Task 1 (ONNX Runtime), Task 2 (audio capture) |
+| **Risk** | 🟡 Medium — Silero VAD's ONNX model has specific input/output tensor shapes and internal state (h/c tensors) that need careful handling |
+
+**Subtasks**:
+
+- **3.1** Download Silero VAD ONNX model (`silero_vad.onnx`, ~2MB); bundle in app target
+- **3.2** Implement `SileroVADModel.swift`:
+  - Load the ONNX model via `OrtSession`
+  - Understand input tensor shape (batch × samples, typically 512 samples at 16kHz = 32ms frames)
+  - Manage hidden state tensors (`h` and `c`) across frames — these must persist between calls
+  - Return speech probability per frame
+- **3.3** Implement `VADConfiguration.swift`:
+  - Speech threshold (default: 0.5)
+  - Minimum speech duration (default: 250ms — avoid firing on clicks/pops)
+  - Silence duration to end utterance (default: 700ms)
+  - Pre-speech padding (default: 300ms — capture the start of speech that triggered VAD)
+- **3.4** Implement `VADProcessor.swift`:
+  - Reads from `CircularAudioBuffer` on a dedicated thread (QoS: `.userInteractive`)
+  - Processes 32ms frames through `SileroVADModel`
+  - Implements state machine: `silence → speech_start → speaking → speech_end`
+  - On `speech_start`: begin accumulating audio frames (including pre-speech padding)
+  - On `speech_end`: package accumulated audio as a complete utterance, emit via callback/AsyncStream
+  - Handle edge cases: very long utterances (>30s) — force-segment to prevent unbounded memory growth
+- **3.5** Build a debug view overlay showing VAD state (silence/speech) and speech probability in real-time
+
+**Acceptance Criteria**: VAD correctly detects speech onset and offset. Silence is filtered. Utterances are segmented and emitted as discrete audio chunks. No false triggers on background noise at reasonable thresholds.
+
+---
+
+### 4. Moonshine ASR Integration
+
+| Field | Detail |
+|---|---|
+| **Estimate** | 5–7 days |
+| **Dependencies** | Task 1 (ONNX Runtime), Task 3 (VAD provides segmented utterances) |
+| **Risk** | 🔴 High — This is the most complex integration. Moonshine's ONNX export, encoder/decoder architecture, and streaming behavior need careful study. CoreML EP compatibility is not guaranteed for all ops. |
+
+**Subtasks**:
+
+- **4.1** Download Moonshine Tiny ONNX model files from HuggingFace (`UsefulSensors/moonshine`). Understand the model structure — Moonshine v2 has separate encoder and decoder ONNX files. Document input/output tensor names and shapes.
+- **4.2** Implement `MoonshineModel.swift`:
+  - Load encoder + decoder ONNX sessions
+  - Implement the inference loop: audio → encoder → decoder (autoregressive token generation)
+  - Handle tokenizer: Moonshine uses a BPE/SentencePiece tokenizer — either port the tokenizer to Swift or use a lightweight C++ binding
+  - Map output token IDs → text
+- **4.3** Implement streaming partial results:
+  - Moonshine v2's streaming encoder processes audio in sliding windows
+  - Emit partial text as tokens are generated (before the utterance is complete)
+  - Design the `TranscriptSegment` data model: `id: UUID`, `partialText: String`, `finalText: String?`, `timestamp: Date`, `audioRange: ClosedRange<TimeInterval>`
+- **4.4** Implement `MoonshineTranscriber.swift`:
+  - Receives segmented audio from VAD
+  - Runs ASR inference on a dedicated thread (QoS: `.userInteractive`)
+  - Emits `TranscriptUpdate.partial` and `TranscriptUpdate.finalized` via `AsyncStream`
+- **4.5** Benchmark on physical device:
+  - Measure real-time factor (RTF) — target: < 0.5 (inference takes less than half the audio duration)
+  - Measure time-to-first-token for a typical utterance
+  - Test with CoreML EP enabled vs. CPU-only — compare latency and verify correctness
+  - If CoreML EP fails on certain ops, identify which ops and decide on fallback strategy
+- **4.6** Implement basic error handling:
+  - Model loading failure (corrupted file, incompatible device)
+  - Inference timeout (utterance too long, device too slow)
+  - Memory pressure (handle `didReceiveMemoryWarning`)
+
+**Acceptance Criteria**: Given a segmented audio utterance from VAD, Moonshine produces a text transcript. Partial results stream as tokens are generated. RTF < 0.5 on iPhone 14+. CoreML EP status is documented (works / partially works / fallback to CPU).
+
+---
+
+### 5. Transcription Pipeline Orchestrator
+
+| Field | Detail |
+|---|---|
+| **Estimate** | 2–3 days |
+| **Dependencies** | Tasks 2, 3, 4 (all pipeline components) |
+| **Risk** | 🟡 Medium — Concurrency coordination between audio, VAD, and ASR threads. Swift 6 strict concurrency will surface issues. |
+
+**Subtasks**:
+
+- **5.1** Implement `TranscriptionPipeline` actor:
+  - Owns `AudioCaptureManager`, `VADProcessor`, `MoonshineTranscriber`
+  - `startSession()`: initializes audio capture → VAD → ASR chain
+  - `stopSession()`: tears down cleanly, returns accumulated transcript
+  - Exposes `AsyncStream<TranscriptUpdate>` for the UI to observe
+- **5.2** Implement `PipelineConfiguration.swift`:
+  - Model variant selection (tiny vs. base — base not used yet but design for it)
+  - VAD sensitivity settings
+  - Debug flags (log audio levels, VAD decisions, ASR timing)
+- **5.3** Implement `TranscriptionSession.swift`:
+  - Accumulates transcript segments in order
+  - Tracks session metadata: start time, duration, segment count
+  - Provides `fullTranscript` computed property (concatenated finalized text)
+- **5.4** Wire up error propagation: errors from any pipeline stage surface as `TranscriptUpdate.error` on the stream
+- **5.5** Test the full pipeline end-to-end on device: speak → see text appear
+
+**Acceptance Criteria**: The pipeline orchestrates audio → VAD → ASR as a single cohesive unit. Starting/stopping a session is clean. Transcript updates stream to observers in real-time. No thread safety violations under Swift 6 strict concurrency.
+
+---
+
+### 6. Minimal Transcription UI
+
+| Field | Detail |
+|---|---|
+| **Estimate** | 2–3 days |
+| **Dependencies** | Task 5 (pipeline wired up) |
+| **Risk** | 🟢 Low — SwiftUI basics; main concern is smooth scrolling with rapid text updates |
+
+**Subtasks**:
+
+- **6.1** Implement `TranscriptionView.swift`:
+  - Large scrolling text area showing transcript
+  - Auto-scrolls to bottom as new text appears
+  - Partial results shown in gray/italic; finalized in black
+  - Record/Stop button (large, prominent)
+  - Elapsed time display
+- **6.2** Implement `AudioLevelIndicator.swift` — simple waveform or level meter showing mic input (confirms the app is listening)
+- **6.3** Implement `SessionTimer.swift` — elapsed time counter (MM:SS format)
+- **6.4** Wire `TranscriptionView` to `TranscriptionPipeline` via `@Observable` view model pattern
+- **6.5** Handle UI edge cases:
+  - Permission denied state (show explanation + settings link)
+  - Model loading state (show spinner on first launch)
+  - Error state (pipeline failure → user-friendly message)
+
+**Acceptance Criteria**: User taps Record, speaks, and sees words appear on screen in near real-time. UI is responsive (no frame drops during rapid text updates). Start/stop works reliably.
+
+---
+
+### 7. Physical Device Testing & Battery Profiling
+
+| Field | Detail |
+|---|---|
+| **Estimate** | 2–3 days |
+| **Dependencies** | Task 6 (full pipeline + UI working) |
+| **Risk** | 🟡 Medium — Battery drain or thermal issues could require architectural changes |
+
+**Subtasks**:
+
+- **7.1** Test on primary device (iPhone 14+):
+  - 5-minute session: verify transcript accuracy is reasonable
+  - 15-minute session: check for memory leaks (Instruments → Leaks)
+  - 30-minute session: measure battery drain (Instruments → Energy Log)
+- **7.2** Profile memory usage (Instruments → Allocations):
+  - Peak memory during active transcription
+  - Memory after stopping session (verify models can be unloaded)
+  - Target: < 400MB peak
+- **7.3** Profile CPU/GPU usage:
+  - Verify CoreML EP is being used (check Instruments → Core ML)
+  - Identify hot spots in the pipeline
+- **7.4** Test edge cases:
+  - Background noise (coffee shop, street) — does VAD filter it?
+  - Rapid speech — does ASR keep up?
+  - Long silence → speech → silence cycles
+  - Device rotation during recording
+- **7.5** Document findings: latency measurements, battery drain rate, memory profile, any issues discovered. Create a `phase1-benchmarks.md` with results.
+
+**Acceptance Criteria**: 30-minute session completes without crashes or memory issues. Battery drain is documented and < 20%/hour. Latency from speech → text on screen is < 500ms. Known issues are documented.
+
+---
+
+## Dependency Graph
+
+```
+Task 1 (Scaffolding)
+  ├──► Task 2 (Audio Capture)
+  │       └──► Task 3 (VAD) ──────┐
+  └──► Task 3 (VAD)               │
+        └──► Task 4 (Moonshine) ◄─┘
+              └──► Task 5 (Pipeline)
+                    └──► Task 6 (UI)
+                          └──► Task 7 (Testing)
+```
+
+Tasks 2 and 3 can be partially parallelized — audio capture can be built and tested independently before wiring VAD to it. Task 4 (Moonshine) is the critical path and highest risk item.
+
+---
+
+## Summary
+
+| Task | Estimate | Risk | Critical Path? |
+|---|---|---|---|
+| 1. Project Scaffolding | 1–2 days | 🟡 Medium | Yes |
+| 2. Audio Capture | 2–3 days | 🟢 Low | Yes |
+| 3. Silero VAD | 3–4 days | 🟡 Medium | Yes |
+| 4. Moonshine ASR | 5–7 days | 🔴 High | **Yes — bottleneck** |
+| 5. Pipeline Orchestrator | 2–3 days | 🟡 Medium | Yes |
+| 6. Minimal UI | 2–3 days | 🟢 Low | Yes |
+| 7. Device Testing | 2–3 days | 🟡 Medium | Yes |
+| **Total** | **17–25 days** | | |
+
+**Critical risk**: Task 4 (Moonshine integration). If ONNX Runtime + CoreML EP doesn't work well with Moonshine's ops, the fallback is CPU-only inference which may be too slow, or switching to Whisper Tiny as a backup ASR model. **Recommendation**: Start a spike on Task 4.1–4.2 in parallel with Task 2 to de-risk early.
