@@ -32,7 +32,7 @@
   - Verified on iPhone 17 Pro simulator: probability cycles 1.0 during speech / <0.02 in silence, state pill cycles through IDLE → LISTENING → SPEAKING → IDLE, utterances close cleanly after ~700ms of silence, WAVs land in Documents, ring-buffer overflow stays at 0.
 - [ ] **Task 4** — Moonshine ASR Integration (in progress)
   - Subtasks carved up as: **4.1** inspect + document (done), **4.1b** ModelAssets + first-run downloader (done), **4.2a** forward pass (done), **4.2b** tokenizer (next), **4.4** VAD→ASR wiring, **4.5+4.6** benchmark + error handling.
-  - [x] **4.2a** — MoonshineModel forward pass (greedy decode, no tokenizer yet)
+  - [x] **4.2a** — MoonshineModel forward pass (commit `fdaf2a0`)
     - `ASR/MoonshineModel.swift` — `nonisolated final class @unchecked Sendable` holding three `ORTSession`s (encoder + no-cache decoder + with-past decoder). `transcribe(samples:) -> [Int64]` runs encoder once, seeds KV cache from `decoder_model.onnx`, then loops `decoder_with_past_model.onnx` with argmax greedy decode until EOS (token 2) or 512 tokens. Self-attn KV grows per step; cross-attn KV is captured from the first call and reused unchanged on every subsequent call.
     - `Utilities/WAVReader.swift` — reads 16-bit PCM WAV back to `[Float]` via `AVAudioFile` (no hand-rolled RIFF parser). Helper `mostRecentUtterance(in:)` picks the latest `utterance-*.wav` in Documents so the smoke test can transcribe the last thing the VAD captured without requiring a fresh recording.
     - `Utilities/SmokeTest.swift` — new `runMoonshineInference()` that grabs latest utterance, loads MoonshineModel, runs greedy decode, prints RTF + token IDs.
