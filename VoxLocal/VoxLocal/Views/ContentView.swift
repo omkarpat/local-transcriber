@@ -8,6 +8,8 @@
 import SwiftUI
 
 struct ContentView: View {
+    @Environment(AppState.self) private var appState
+
     var body: some View {
         NavigationStack {
             List {
@@ -19,6 +21,14 @@ struct ContentView: View {
                 }
                 Button("Run VAD Sanity Inference") {
                     SmokeTest.runSileroVADInferenceSanity()
+                }
+
+                Section("Developer") {
+                    Button(role: .destructive) {
+                        appState.resetInstall()
+                    } label: {
+                        Text("Reinstall Models")
+                    }
                 }
             }
             .navigationTitle("VoxLocal")
