@@ -98,6 +98,7 @@
   - `App/AppState.swift` — now constructs a single `TranscriptionPipeline` with `debug: true` once `MoonshineTranscriber` finishes loading; `pipeline` property exposed to views. `resetInstall()` clears it.
   - `VAD/VADConfiguration.swift` — gained `Equatable` (needed by `PipelineConfiguration: Equatable`; all fields were already trivially equatable).
   - UI rewire (new `TranscriptionView`, `AudioCaptureDebugView` consuming the pipeline, shared `TranscriptRow.upsert(_:)`) lands in Task 6's commit.
+  - **Punctuation retry with backoff** (commit TBD after the initial actor landed): `TranscriptionPipeline` now keeps a `pendingPunctuation` FIFO (cap 100) of utterances whose first `/punctuate` call failed (timeout / 5xx / network). A single retry task runs whenever the queue is non-empty, sleeping between attempts and exponentially backing off from 5 s to 60 s while the server is still unreachable. A successful call — first-try or retry — immediately kicks a fresh drain (bypassing any sleeping retry task) because we just confirmed the server is up. Queue is in-memory only, so raw rows from before an app kill stay raw; this matches the silent-fallback contract (no errors surface to the UI). `TranscriptionPipeline.pendingPunctuationCount` is exposed for future UI indicators.
 - [ ] **Task 6** — Minimal Transcription UI
 - [ ] **Task 7** — Physical Device Testing & Battery Profiling
 

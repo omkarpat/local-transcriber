@@ -37,6 +37,29 @@ actor TranscriptionPipeline {
     private var configuration: PipelineConfiguration = .default
     private var running = false
 
+    /// Punctuation requests that failed on first-try (server down, timeout,
+    /// 5xx). Retried on a backoff timer until each one lands or the queue
+    /// overflows. In-memory only — lost across app restarts, which is
+    /// acceptable for Phase 1 (and matches the silent-fallback contract).
+    private var pendingPunctuation: [PendingPunctuation] = []
+    private var retryTask: Task<Void, Never>?
+
+    /// Smallest wait between retry attempts. Picked to feel responsive
+    /// ("network back? within 5 s everything catches up") without
+    /// dog-piling a recovering server.
+    private let minRetryDelay: Duration = .seconds(5)
+    /// Cap on exponential backoff when the server keeps refusing us.
+    private let maxRetryDelay: Duration = .seconds(60)
+    /// Safety cap on the queue so a long outage doesn't balloon memory.
+    /// At ~100-char transcripts this tops out around ~20 KB — cheap.
+    private let maxPendingPunctuation = 100
+
+    private struct PendingPunctuation: Sendable {
+        let utteranceID: UUID
+        let text: String
+        let utteranceDuration: Duration
+    }
+
     init(
         transcriber: MoonshineTranscriber,
         punctuationClient: PunctuationClient,
@@ -84,6 +107,11 @@ actor TranscriptionPipeline {
     /// (VAD) is falling behind producer (mic); only hits in pathological
     /// conditions in practice.
     var overflowSamples: Int { manager.ringBuffer.overflowSamples }
+
+    /// How many finalized utterances are currently waiting on a retry
+    /// punctuation call. Zero in the happy path; grows during server
+    /// outages and drains back to zero once the server is reachable.
+    var pendingPunctuationCount: Int { pendingPunctuation.count }
 
     /// Start a fresh session. Idempotent — already-running is a no-op.
     /// Throws on audio/permission failure; VAD errors surface later on
@@ -177,27 +205,127 @@ actor TranscriptionPipeline {
     private func startTranscriptForwarding() {
         guard transcriptForwardTask == nil else { return }
         let updatesContinuation = self.updatesContinuation
-        let punctuate = self.punctuationClient
         let transcriberUpdates = transcriber.updates
         transcriptForwardTask = Task { [weak self] in
             for await update in transcriberUpdates {
                 updatesContinuation.yield(update)
                 guard case .finalized(let result) = update else { continue }
                 guard let self, await self.configuration.enableCloudPunctuation else { continue }
-                // Detached so the punctuation hop doesn't serialize with
-                // the transcriber's stream — multiple utterances can be in
-                // flight simultaneously.
-                Task.detached {
-                    if let punctuated = await punctuate.punctuate(
-                        utteranceID: result.utteranceID,
-                        text: result.text,
-                        utteranceDuration: result.utteranceDuration
-                    ) {
-                        updatesContinuation.yield(.punctuated(punctuated))
-                    }
-                }
+                await self.dispatchFirstTryPunctuation(for: result)
             }
         }
+    }
+
+    /// First-try punctuation for a freshly-finalized utterance. Detached
+    /// so multiple utterances can be in flight in parallel — the
+    /// happy-path RTT on localhost is ~80 ms, but real networks vary.
+    /// On failure, enqueue for the retry loop to pick up.
+    private func dispatchFirstTryPunctuation(for result: TranscriptResult) {
+        let client = punctuationClient
+        Task.detached { [weak self] in
+            let punctuated = await client.punctuate(
+                utteranceID: result.utteranceID,
+                text: result.text,
+                utteranceDuration: result.utteranceDuration
+            )
+            guard let self else { return }
+            if let punctuated {
+                await self.handlePunctuationSuccess(punctuated)
+            } else {
+                await self.enqueueForRetry(
+                    utteranceID: result.utteranceID,
+                    text: result.text,
+                    utteranceDuration: result.utteranceDuration
+                )
+            }
+        }
+    }
+
+    /// A punctuate call just landed. Publish the result and — if we have
+    /// a backlog — kick an immediate drain, since we just confirmed the
+    /// server is reachable.
+    private func handlePunctuationSuccess(_ p: TranscriptPunctuated) {
+        updatesContinuation.yield(.punctuated(p))
+        guard !pendingPunctuation.isEmpty else { return }
+        retryTask?.cancel()
+        retryTask = Task { [weak self] in
+            await self?.drainLoop(initialDelay: .zero)
+        }
+    }
+
+    /// Stash a failed request. Idempotent per utteranceID (guards against
+    /// a double-enqueue if a retry attempt fails while the first-try
+    /// callback is still in flight). Starts the retry loop if not already
+    /// running.
+    private func enqueueForRetry(utteranceID: UUID, text: String, utteranceDuration: Duration) {
+        if pendingPunctuation.contains(where: { $0.utteranceID == utteranceID }) { return }
+        pendingPunctuation.append(PendingPunctuation(
+            utteranceID: utteranceID,
+            text: text,
+            utteranceDuration: utteranceDuration
+        ))
+        if pendingPunctuation.count > maxPendingPunctuation {
+            let drop = pendingPunctuation.count - maxPendingPunctuation
+            pendingPunctuation.removeFirst(drop)
+            log.warning("punctuation backlog at cap — dropped \(drop, privacy: .public) oldest item(s)")
+        }
+        ensureRetryLoop()
+    }
+
+    private func ensureRetryLoop() {
+        guard retryTask == nil else { return }
+        retryTask = Task { [weak self] in
+            await self?.drainLoop(initialDelay: self?.minRetryDelay ?? .seconds(5))
+        }
+    }
+
+    /// Keeps retrying until the queue drains or the owning actor goes
+    /// away. `initialDelay` lets the happy-path-recovered case (server
+    /// just answered) skip straight to a drain without waiting 5 s.
+    private func drainLoop(initialDelay: Duration) async {
+        var delay = initialDelay
+        while !Task.isCancelled && !pendingPunctuation.isEmpty {
+            if delay > .zero {
+                do { try await Task.sleep(for: delay) }
+                catch { break }  // cancelled mid-sleep
+            }
+            let drained = await drainAsManyAsPossible()
+            if pendingPunctuation.isEmpty { break }
+            if drained > 0 {
+                // Made partial progress — server is flaky but responding.
+                // Keep the pressure on at min delay.
+                delay = minRetryDelay
+            } else {
+                // Zero progress — back off.
+                delay = (delay == .zero) ? minRetryDelay : min(delay * 2, maxRetryDelay)
+                log.info("punctuation retry backing off to \(String(describing: delay), privacy: .public); \(self.pendingPunctuation.count, privacy: .public) pending")
+            }
+        }
+        retryTask = nil
+    }
+
+    /// Pop items off the front of the queue and punctuate them one at a
+    /// time until we hit a failure. Returns the count we got through —
+    /// zero means the server is still down.
+    private func drainAsManyAsPossible() async -> Int {
+        var drained = 0
+        while let next = pendingPunctuation.first {
+            if Task.isCancelled { break }
+            let punctuated = await punctuationClient.punctuate(
+                utteranceID: next.utteranceID,
+                text: next.text,
+                utteranceDuration: next.utteranceDuration
+            )
+            guard let punctuated else { break }
+            // Guard against the queue being mutated during the await.
+            // We only pop if the head is still the item we just sent.
+            if pendingPunctuation.first?.utteranceID == next.utteranceID {
+                pendingPunctuation.removeFirst()
+            }
+            updatesContinuation.yield(.punctuated(punctuated))
+            drained += 1
+        }
+        return drained
     }
 }
 
