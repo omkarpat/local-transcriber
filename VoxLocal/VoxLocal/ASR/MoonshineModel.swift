@@ -17,6 +17,21 @@ enum MoonshineError: Error, CustomStringConvertible {
     }
 }
 
+/// Stage-by-stage timings for one `transcribe(samples:)` call. Useful for
+/// benchmarking and for the debug UI to show where time goes.
+nonisolated struct TranscriptionTimings: Sendable {
+    let encoder: Duration
+    let firstDecodeCall: Duration
+    let cacheDecodeCalls: Duration  // sum across every cached call
+    let total: Duration              // wall-clock encoder + decoder end-to-end
+    let cacheCallCount: Int          // how many cached-decoder steps ran
+}
+
+nonisolated struct TranscriptionResult: Sendable {
+    let tokens: [Int64]
+    let timings: TranscriptionTimings
+}
+
 /// Moonshine Tiny ASR wrapper.
 ///
 /// Runs an encoder + a split decoder pair (no-cache for the first token,
@@ -60,10 +75,27 @@ nonisolated final class MoonshineModel: @unchecked Sendable {
 
     /// Greedy-decode a single utterance and return the generated token IDs
     /// (not including the decoder-start token, up to and including EOS if
-    /// reached, capped at `maxGeneratedTokens`).
-    func transcribe(samples: [Float]) throws -> [Int64] {
+    /// reached, capped at `maxGeneratedTokens`) plus stage-by-stage timings.
+    func transcribe(samples: [Float]) throws -> TranscriptionResult {
+        let wallStart = Date()
+
+        let encStart = Date()
         let encoderOutput = try runEncoder(samples: samples)
-        return try decodeGreedy(encoderHiddenStates: encoderOutput)
+        let encoderDuration = Duration.seconds(Date().timeIntervalSince(encStart))
+
+        let decodeResult = try decodeGreedy(encoderHiddenStates: encoderOutput)
+        let total = Duration.seconds(Date().timeIntervalSince(wallStart))
+
+        return TranscriptionResult(
+            tokens: decodeResult.tokens,
+            timings: TranscriptionTimings(
+                encoder: encoderDuration,
+                firstDecodeCall: decodeResult.firstCallDuration,
+                cacheDecodeCalls: decodeResult.cacheCallsTotal,
+                total: total,
+                cacheCallCount: decodeResult.cacheCallCount
+            )
+        )
     }
 
     // MARK: - Encoder
@@ -115,7 +147,14 @@ nonisolated final class MoonshineModel: @unchecked Sendable {
         let crossSeqLen: Int              // T_enc (fixed)
     }
 
-    private func decodeGreedy(encoderHiddenStates encOut: EncoderOutput) throws -> [Int64] {
+    private struct DecodeResult {
+        let tokens: [Int64]
+        let firstCallDuration: Duration
+        let cacheCallsTotal: Duration
+        let cacheCallCount: Int
+    }
+
+    private func decodeGreedy(encoderHiddenStates encOut: EncoderOutput) throws -> DecodeResult {
         var tokens: [Int64] = []
 
         // --- First call: decoder_model.onnx, takes input_ids + encoder_hidden_states,
@@ -142,21 +181,32 @@ nonisolated final class MoonshineModel: @unchecked Sendable {
             firstOutputNames.insert("present.\(layer).encoder.key")
             firstOutputNames.insert("present.\(layer).encoder.value")
         }
+        let firstCallStart = Date()
         let firstOutputs = try decoderNoCache.run(
             withInputs: ["input_ids": firstInputTensor, "encoder_hidden_states": encoderTensor],
             outputNames: firstOutputNames,
             runOptions: nil
         )
+        let firstCallDuration = Duration.seconds(Date().timeIntervalSince(firstCallStart))
 
         let firstToken = try argmaxLastPosition(logitsValue: try required(firstOutputs, "logits"))
         tokens.append(firstToken)
-        if firstToken == Self.eosTokenID { return tokens }
+        if firstToken == Self.eosTokenID {
+            return DecodeResult(
+                tokens: tokens,
+                firstCallDuration: firstCallDuration,
+                cacheCallsTotal: .zero,
+                cacheCallCount: 0
+            )
+        }
 
         // Seed the KV cache from the first call's present.* outputs.
         var cache = try buildKVCache(fromFirstCallOutputs: firstOutputs)
 
         // --- Loop: decoder_with_past_model.onnx, takes one new token + full past KVs.
         var currentToken = firstToken
+        var cacheCallsTotal: Duration = .zero
+        var cacheCallCount = 0
         while tokens.count < Self.maxGeneratedTokens {
             let inputIDData = makeInt64Data([currentToken])
             let inputIDTensor = try ORTValue(tensorData: inputIDData,
@@ -188,9 +238,12 @@ nonisolated final class MoonshineModel: @unchecked Sendable {
                 outputNames.insert("present.\(layer).decoder.key")
                 outputNames.insert("present.\(layer).decoder.value")
             }
+            let cacheCallStart = Date()
             let outputs = try decoderWithPast.run(withInputs: inputs,
                                                   outputNames: outputNames,
                                                   runOptions: nil)
+            cacheCallsTotal += Duration.seconds(Date().timeIntervalSince(cacheCallStart))
+            cacheCallCount += 1
 
             let nextToken = try argmaxLastPosition(logitsValue: try required(outputs, "logits"))
             tokens.append(nextToken)
@@ -207,7 +260,12 @@ nonisolated final class MoonshineModel: @unchecked Sendable {
             currentToken = nextToken
         }
 
-        return tokens
+        return DecodeResult(
+            tokens: tokens,
+            firstCallDuration: firstCallDuration,
+            cacheCallsTotal: cacheCallsTotal,
+            cacheCallCount: cacheCallCount
+        )
     }
 
     // MARK: - Helpers

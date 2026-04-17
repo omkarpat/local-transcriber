@@ -31,8 +31,8 @@ nonisolated final class MoonshineTranscriber: @unchecked Sendable {
     }
 
     /// Kick off transcription of a single utterance. Returns immediately;
-    /// the completed `TranscriptUpdate` shows up on `updates` when
-    /// inference finishes.
+    /// the completed `TranscriptUpdate` (either `.finalized` or `.failed`)
+    /// shows up on `updates` when inference settles.
     func enqueue(samples: [Float], duration: Duration) {
         let model = self.model
         let tokenizer = self.tokenizer
@@ -41,19 +41,24 @@ nonisolated final class MoonshineTranscriber: @unchecked Sendable {
         Task.detached(priority: .userInitiated) {
             let start = Date()
             do {
-                let tokens = try model.transcribe(samples: samples)
-                let text = tokenizer.decode(tokenIDs: tokens)
+                let result = try model.transcribe(samples: samples)
+                let text = tokenizer.decode(tokenIDs: result.tokens)
                 let inferenceDuration = Duration.seconds(Date().timeIntervalSince(start))
-                continuation.yield(TranscriptUpdate(
+                continuation.yield(.finalized(TranscriptResult(
                     id: UUID(),
                     text: text,
                     utteranceDuration: duration,
                     inferenceDuration: inferenceDuration,
-                    tokenCount: tokens.count
-                ))
+                    tokenCount: result.tokens.count,
+                    timings: result.timings
+                )))
             } catch {
-                // Error channel lands in 4.6. For now log and drop.
                 log.error("transcription failed: \(String(describing: error))")
+                continuation.yield(.failed(TranscriptFailure(
+                    id: UUID(),
+                    utteranceDuration: duration,
+                    message: String(describing: error)
+                )))
             }
         }
     }

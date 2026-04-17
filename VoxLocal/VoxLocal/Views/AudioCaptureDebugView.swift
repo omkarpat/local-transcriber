@@ -235,21 +235,39 @@ struct AudioCaptureDebugView: View {
                     .foregroundStyle(.secondary)
                 ScrollView {
                     VStack(alignment: .leading, spacing: 8) {
-                        ForEach(model.transcripts) { t in
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(t.text.isEmpty ? "(empty)" : t.text)
-                                    .font(.body)
-                                Text("\(format(duration: t.utteranceDuration))  ·  \(String(format: "RTF %.2f", t.realTimeFactor))  ·  \(t.tokenCount) tok")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                        ForEach(model.transcripts) { update in
+                            transcriptRow(update)
+                                .frame(maxWidth: .infinity, alignment: .leading)
                         }
                     }
                 }
                 .frame(maxHeight: 180)
             }
             .padding(.horizontal)
+        }
+    }
+
+    @ViewBuilder
+    private func transcriptRow(_ update: TranscriptUpdate) -> some View {
+        switch update {
+        case .finalized(let r):
+            VStack(alignment: .leading, spacing: 2) {
+                Text(r.text.isEmpty ? "(empty)" : r.text)
+                    .font(.body)
+                Text("\(format(duration: r.utteranceDuration))  ·  \(String(format: "RTF %.2f", r.realTimeFactor))  ·  \(r.tokenCount) tok")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        case .failed(let f):
+            VStack(alignment: .leading, spacing: 2) {
+                Text("⚠︎ transcription failed")
+                    .font(.body)
+                    .foregroundStyle(.red)
+                Text(f.message)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+            }
         }
     }
 

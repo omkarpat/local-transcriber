@@ -30,6 +30,11 @@ struct ContentView: View {
                         await SmokeTest.runMoonshineInference()
                     }
                 }
+                Button("Benchmark Moonshine (CoreML vs CPU)") {
+                    Task.detached(priority: .userInitiated) {
+                        await SmokeTest.runMoonshineBenchmark()
+                    }
+                }
 
                 Section("Developer") {
                     Button(role: .destructive) {

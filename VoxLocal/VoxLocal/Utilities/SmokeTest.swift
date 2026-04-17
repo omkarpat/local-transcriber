@@ -51,17 +51,83 @@ nonisolated enum SmokeTest {
             print(String(format: "[MoonshineSmoke] loaded model + tokenizer  %.2fs", Date().timeIntervalSince(loadStart)))
 
             let inferStart = Date()
-            let tokens = try model.transcribe(samples: samples)
+            let result = try model.transcribe(samples: samples)
             let inferTime = Date().timeIntervalSince(inferStart)
             let rtf = inferTime / (Double(durationMS) / 1000.0)
 
-            print("[MoonshineSmoke] generated \(tokens.count) tokens in \(String(format: "%.2fs", inferTime)) (RTF=\(String(format: "%.2f", rtf)))")
-            print("[MoonshineSmoke] token IDs: \(tokens)")
-            let text = tokenizer.decode(tokenIDs: tokens)
+            print("[MoonshineSmoke] generated \(result.tokens.count) tokens in \(String(format: "%.2fs", inferTime)) (RTF=\(String(format: "%.2f", rtf)))")
+            print("[MoonshineSmoke] token IDs: \(result.tokens)")
+            let text = tokenizer.decode(tokenIDs: result.tokens)
             print("[MoonshineSmoke] transcript: \"\(text)\"")
         } catch {
             print("[MoonshineSmoke] Failed: \(error)")
         }
+    }
+
+    /// Benchmark Moonshine Tiny against the most recent utterance. Runs
+    /// `iterations` transcribe passes with CoreML EP on, then with CoreML
+    /// EP off (CPU only), prints per-phase min / median / p95 stats to the
+    /// console. One warmup pass is discarded per configuration.
+    static func runMoonshineBenchmark(iterations: Int = 5) async {
+        guard let wavURL = WAVReader.mostRecentUtterance() else {
+            print("[MoonshineBench] No utterance-*.wav found in Documents. Record one via Audio Capture first.")
+            return
+        }
+        do {
+            let samples = try WAVReader.readFloat32Samples(from: wavURL)
+            let durationSeconds = Double(samples.count) / AudioFormat.sampleRate
+            print("[MoonshineBench] WAV: \(wavURL.lastPathComponent)  duration=\(String(format: "%.2fs", durationSeconds))  iters=\(iterations)")
+
+            try await bench(label: "CoreML EP", samples: samples, durationSeconds: durationSeconds, iterations: iterations, useCoreML: true)
+            try await bench(label: "CPU only ", samples: samples, durationSeconds: durationSeconds, iterations: iterations, useCoreML: false)
+        } catch {
+            print("[MoonshineBench] Failed: \(error)")
+        }
+    }
+
+    private static func bench(label: String, samples: [Float], durationSeconds: Double, iterations: Int, useCoreML: Bool) async throws {
+        let loadStart = Date()
+        let model = try MoonshineModel(useCoreML: useCoreML)
+        let loadTime = Date().timeIntervalSince(loadStart)
+        // Warmup — first pass always pays graph-compile costs that skew stats.
+        _ = try model.transcribe(samples: samples)
+
+        var totals: [Double] = []
+        var encoders: [Double] = []
+        var firstDecodes: [Double] = []
+        var cacheDecodes: [Double] = []
+        var tokenCounts: [Int] = []
+        for _ in 0..<iterations {
+            let r = try model.transcribe(samples: samples)
+            totals.append(seconds(r.timings.total))
+            encoders.append(seconds(r.timings.encoder))
+            firstDecodes.append(seconds(r.timings.firstDecodeCall))
+            cacheDecodes.append(seconds(r.timings.cacheDecodeCalls))
+            tokenCounts.append(r.tokens.count)
+        }
+        let tokCount = tokenCounts.first ?? 0
+        print(String(format: "[MoonshineBench] %@  load=%.2fs  tokens=%d  (N=%d)", label, loadTime, tokCount, iterations))
+        printStats(label: "  total      ", values: totals, audioSec: durationSeconds)
+        printStats(label: "  encoder    ", values: encoders, audioSec: durationSeconds)
+        printStats(label: "  1st-decode ", values: firstDecodes, audioSec: nil)
+        printStats(label: "  cache-loop ", values: cacheDecodes, audioSec: nil)
+    }
+
+    private static func printStats(label: String, values: [Double], audioSec: Double?) {
+        let sorted = values.sorted()
+        let median = sorted[sorted.count / 2]
+        let p95 = sorted[min(sorted.count - 1, Int(Double(sorted.count) * 0.95))]
+        let minV = sorted.first ?? 0
+        let mean = sorted.reduce(0, +) / Double(sorted.count)
+        var line = String(format: "%@ min=%.3fs  median=%.3fs  mean=%.3fs  p95=%.3fs", label, minV, median, mean, p95)
+        if let audioSec, audioSec > 0 {
+            line += String(format: "  (RTF median=%.2f)", median / audioSec)
+        }
+        print(line)
+    }
+
+    private static func seconds(_ d: Duration) -> Double {
+        Double(d.components.seconds) + Double(d.components.attoseconds) / 1e18
     }
 
     /// Feed the VAD model a few known synthetic signals and print the probability it returns.
