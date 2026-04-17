@@ -15,7 +15,7 @@
   - `Utilities/SmokeTest.swift` + bundled `VAD/silero_vad.onnx` (2.3MB)
   - Smoke test verified on iPhone 17 Pro simulator: session creates, CoreML EP partitions the graph (18/39 nodes accelerated), inputs `[input, state, sr]`, outputs `[output, stateN]`
   - `CLAUDE.md` at repo root captures Xcode 26 synchronized-group gotcha
-- [x] **Task 2** — Audio Capture Manager
+- [x] **Task 2** — Audio Capture Manager (commit `50d9fbe`)
   - `Audio/AudioFormat.swift` — 16kHz / mono / Float32 constants + `AVAudioFormat` factory
   - `Audio/CircularAudioBuffer.swift` — lock-free SPSC ring buffer using Swift 6 `Synchronization.Atomic`; drop-oldest overflow with running `overflowSamples` counter; capacity rounded to next power of 2 for mask-based indexing
   - `Audio/Permissions.swift` — mic permission via `AVAudioApplication.requestRecordPermission()` (iOS 17+ API)
