@@ -1,25 +1,39 @@
 import Foundation
 
 /// One ASR result emitted by `MoonshineTranscriber` on its `updates`
-/// stream. Either the utterance transcribed cleanly or inference failed
-/// — both surface to the UI so users see when something broke instead of
-/// silently dropping.
+/// stream. `.partial` is a best-guess snapshot while the user is still
+/// speaking; `.finalized` is the authoritative transcript once VAD closes
+/// the utterance; `.failed` surfaces inference errors so the UI can show
+/// them instead of silently dropping.
 ///
-/// Partial / streaming results are deferred past Phase 1 (see plan.md
-/// Task 4.3).
+/// Partials and the final result for one utterance share a `utteranceID`
+/// so the UI can upsert them into a single row.
 nonisolated enum TranscriptUpdate: Sendable, Identifiable, Equatable {
+    case partial(TranscriptPartial)
     case finalized(TranscriptResult)
     case failed(TranscriptFailure)
 
+    /// Per-inference ID (unique to each emitted update).
     var id: UUID {
         switch self {
+        case .partial(let p): return p.id
         case .finalized(let r): return r.id
         case .failed(let f): return f.id
         }
     }
 
+    /// Groups partials + final for the same utterance onto one UI row.
+    var utteranceID: UUID {
+        switch self {
+        case .partial(let p): return p.utteranceID
+        case .finalized(let r): return r.utteranceID
+        case .failed(let f): return f.utteranceID
+        }
+    }
+
     var utteranceDuration: Duration {
         switch self {
+        case .partial(let p): return p.utteranceDuration
         case .finalized(let r): return r.utteranceDuration
         case .failed(let f): return f.utteranceDuration
         }
@@ -28,6 +42,7 @@ nonisolated enum TranscriptUpdate: Sendable, Identifiable, Equatable {
 
 nonisolated struct TranscriptResult: Sendable, Identifiable, Equatable {
     let id: UUID
+    let utteranceID: UUID
     let text: String
     let utteranceDuration: Duration
     let inferenceDuration: Duration    // wall clock: model + tokenizer
@@ -52,8 +67,20 @@ nonisolated struct TranscriptResult: Sendable, Identifiable, Equatable {
     }
 }
 
+/// Best-guess transcript for an utterance that hasn't ended yet. Produced
+/// when `VADConfiguration.partialTranscriptionInterval` is set; replaced
+/// in the UI by the `TranscriptResult` when VAD closes the utterance.
+nonisolated struct TranscriptPartial: Sendable, Identifiable, Equatable {
+    let id: UUID
+    let utteranceID: UUID
+    let text: String
+    let utteranceDuration: Duration    // audio length at the tick that produced this partial
+    let inferenceDuration: Duration
+}
+
 nonisolated struct TranscriptFailure: Sendable, Identifiable, Equatable {
     let id: UUID
+    let utteranceID: UUID
     let utteranceDuration: Duration
     let message: String
 }

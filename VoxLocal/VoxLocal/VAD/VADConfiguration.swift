@@ -16,6 +16,13 @@ struct VADConfiguration: Sendable {
     /// Hard cap on utterance length to prevent unbounded buffering.
     var maxUtteranceDuration: Duration = .seconds(30)
 
+    /// How often to emit `.utteranceProgress` events while inside an
+    /// utterance, so downstream ASR can produce partial transcripts.
+    /// `nil` disables partials (behavior matches pre-partial builds).
+    /// Measured in VAD frames internally, so the effective interval
+    /// rounds to the nearest multiple of `frameDuration` (~32 ms).
+    var partialTranscriptionInterval: Duration? = nil
+
     static let `default` = VADConfiguration()
 }
 

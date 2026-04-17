@@ -7,6 +7,24 @@ enum DebugVADState: String {
     case speaking = "speaking"
 }
 
+/// UI row for one utterance. `id == utteranceID` so SwiftUI's `ForEach`
+/// updates the existing row in place when a partial is replaced by the
+/// final result.
+struct TranscriptRow: Identifiable, Equatable {
+    enum Status: Equatable {
+        case partial
+        case final(tokenCount: Int, realTimeFactor: Double)
+        case failed(message: String)
+    }
+
+    let utteranceID: UUID
+    var id: UUID { utteranceID }
+    var status: Status
+    var text: String
+    var utteranceDuration: Duration
+    var inferenceDuration: Duration
+}
+
 @Observable
 final class AudioCaptureDebugModel {
     let manager = AudioCaptureManager()
@@ -27,7 +45,12 @@ final class AudioCaptureDebugModel {
     var lastUtteranceDuration: Duration = .zero
     var lastUtterancePath: String?
     var errorMessage: String?
-    var transcripts: [TranscriptUpdate] = []   // most recent first
+    var transcripts: [TranscriptRow] = []   // most recent first; partials upsert in place
+
+    /// Partial-transcription tick interval in ms. `nil` means partials
+    /// are off (behavior matches pre-partial builds). Applied on
+    /// `.start()`; changing while running requires stop→start.
+    var partialIntervalMs: Int? = 1500
 
     func toggle() async {
         if isRunning {
@@ -41,7 +64,9 @@ final class AudioCaptureDebugModel {
         do {
             try await ensureTranscriber()
             try await manager.start()
-            let vad = VADProcessor(ringBuffer: manager.ringBuffer)
+            var config = VADConfiguration.default
+            config.partialTranscriptionInterval = partialIntervalMs.map { .milliseconds($0) }
+            let vad = VADProcessor(ringBuffer: manager.ringBuffer, configuration: config)
             self.vad = vad
             subscribe(to: vad.events)
             vad.start()
@@ -102,13 +127,71 @@ final class AudioCaptureDebugModel {
             for await update in t.updates {
                 guard let self else { return }
                 await MainActor.run {
-                    // Newest first, cap history so the view doesn't grow unbounded.
-                    self.transcripts.insert(update, at: 0)
-                    if self.transcripts.count > 20 {
-                        self.transcripts.removeLast(self.transcripts.count - 20)
-                    }
+                    self.upsert(update)
                 }
             }
+        }
+    }
+
+    /// Inserts or updates the row for `update.utteranceID`. Rules:
+    /// - `.partial`: create a new row at top, or replace an existing
+    ///   `.partial` in place. If the row is already `.final`/`.failed`
+    ///   (late partial returning after final), ignore — final wins.
+    /// - `.finalized`: replace the row in place, or insert at top if
+    ///   no row exists yet (short utterances may skip partials).
+    /// - `.failed`: same as finalized.
+    /// Capped at 20 rows.
+    @MainActor
+    private func upsert(_ update: TranscriptUpdate) {
+        let utteranceID = update.utteranceID
+        let existingIndex = transcripts.firstIndex(where: { $0.utteranceID == utteranceID })
+        switch update {
+        case .partial(let p):
+            if let idx = existingIndex {
+                if case .partial = transcripts[idx].status {
+                    transcripts[idx].text = p.text
+                    transcripts[idx].utteranceDuration = p.utteranceDuration
+                    transcripts[idx].inferenceDuration = p.inferenceDuration
+                }
+                // final / failed rows ignore late partials
+            } else {
+                transcripts.insert(TranscriptRow(
+                    utteranceID: utteranceID,
+                    status: .partial,
+                    text: p.text,
+                    utteranceDuration: p.utteranceDuration,
+                    inferenceDuration: p.inferenceDuration
+                ), at: 0)
+            }
+        case .finalized(let r):
+            let row = TranscriptRow(
+                utteranceID: utteranceID,
+                status: .final(tokenCount: r.tokenCount, realTimeFactor: r.realTimeFactor),
+                text: r.text,
+                utteranceDuration: r.utteranceDuration,
+                inferenceDuration: r.inferenceDuration
+            )
+            if let idx = existingIndex {
+                transcripts[idx] = row
+            } else {
+                transcripts.insert(row, at: 0)
+            }
+        case .failed(let f):
+            let row = TranscriptRow(
+                utteranceID: utteranceID,
+                status: .failed(message: f.message),
+                text: "",
+                utteranceDuration: f.utteranceDuration,
+                inferenceDuration: .zero
+            )
+            if let idx = existingIndex {
+                transcripts[idx] = row
+            } else {
+                transcripts.insert(row, at: 0)
+            }
+        }
+        if transcripts.count > 20 {
+            transcripts.removeLast(transcripts.count - 20)
         }
     }
 
@@ -118,14 +201,16 @@ final class AudioCaptureDebugModel {
         case .frame(let prob, let isSpeech):
             probability = prob
             if vadState == .idle && isSpeech { vadState = .listening }
-        case .utteranceStarted:
+        case .utteranceStarted(_):
             vadState = .speaking
-        case .utteranceEnded(let samples, let duration):
+        case .utteranceProgress(let id, let samples, let duration):
+            transcriber?.enqueuePartial(utteranceID: id, samples: samples, duration: duration)
+        case .utteranceEnded(let id, let samples, let duration):
             vadState = .idle
             utteranceCount += 1
             lastUtteranceDuration = duration
             dumpUtterance(samples: samples)
-            transcriber?.enqueue(samples: samples, duration: duration)
+            transcriber?.enqueue(utteranceID: id, samples: samples, duration: duration)
         case .error(let message):
             errorMessage = message
         }
@@ -154,6 +239,7 @@ struct AudioCaptureDebugView: View {
     @State private var model = AudioCaptureDebugModel()
 
     var body: some View {
+        @Bindable var model = model
         VStack(spacing: 20) {
             Text("Audio + VAD")
                 .font(.title2).bold()
@@ -184,6 +270,21 @@ struct AudioCaptureDebugView: View {
                 metricRow("Overflow", value: "\(model.overflowSamples)")
             }
             .font(.system(.footnote, design: .monospaced))
+            .padding(.horizontal)
+
+            HStack {
+                Text("Partial interval").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Picker("Partial interval", selection: $model.partialIntervalMs) {
+                    Text("Off").tag(Int?.none)
+                    ForEach([500, 750, 1000, 1250, 1500, 1750, 2000, 2500, 3000], id: \.self) { ms in
+                        Text("\(ms) ms").tag(Int?.some(ms))
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .disabled(model.isRunning)
+            }
             .padding(.horizontal)
 
             HStack(spacing: 12) {
@@ -235,8 +336,8 @@ struct AudioCaptureDebugView: View {
                     .foregroundStyle(.secondary)
                 ScrollView {
                     VStack(alignment: .leading, spacing: 8) {
-                        ForEach(model.transcripts) { update in
-                            transcriptRow(update)
+                        ForEach(model.transcripts) { row in
+                            transcriptRow(row)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
                     }
@@ -248,22 +349,31 @@ struct AudioCaptureDebugView: View {
     }
 
     @ViewBuilder
-    private func transcriptRow(_ update: TranscriptUpdate) -> some View {
-        switch update {
-        case .finalized(let r):
+    private func transcriptRow(_ row: TranscriptRow) -> some View {
+        switch row.status {
+        case .partial:
             VStack(alignment: .leading, spacing: 2) {
-                Text(r.text.isEmpty ? "(empty)" : r.text)
-                    .font(.body)
-                Text("\(format(duration: r.utteranceDuration))  ·  \(String(format: "RTF %.2f", r.realTimeFactor))  ·  \(r.tokenCount) tok")
+                Text(row.text.isEmpty ? "…" : row.text + " …")
+                    .font(.body.italic())
+                    .foregroundStyle(.secondary)
+                Text("\(format(duration: row.utteranceDuration))  ·  partial")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
-        case .failed(let f):
+        case .final(let tokenCount, let rtf):
+            VStack(alignment: .leading, spacing: 2) {
+                Text(row.text.isEmpty ? "(empty)" : row.text)
+                    .font(.body)
+                Text("\(format(duration: row.utteranceDuration))  ·  \(String(format: "RTF %.2f", rtf))  ·  \(tokenCount) tok")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        case .failed(let message):
             VStack(alignment: .leading, spacing: 2) {
                 Text("⚠︎ transcription failed")
                     .font(.body)
                     .foregroundStyle(.red)
-                Text(f.message)
+                Text(message)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .lineLimit(3)

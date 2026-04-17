@@ -3,8 +3,13 @@ import os
 
 enum VADEvent: Sendable {
     case frame(probability: Float, isSpeech: Bool)
-    case utteranceStarted
-    case utteranceEnded(samples: [Float], duration: Duration)
+    case utteranceStarted(utteranceID: UUID)
+    /// In-progress snapshot of the current utterance; emitted on the
+    /// cadence set by `VADConfiguration.partialTranscriptionInterval`.
+    /// `samples` is the full buffer from utterance start through the
+    /// tick — it grows monotonically until `.utteranceEnded`.
+    case utteranceProgress(utteranceID: UUID, samples: [Float], duration: Duration)
+    case utteranceEnded(utteranceID: UUID, samples: [Float], duration: Duration)
     case error(String)
 }
 
@@ -82,11 +87,16 @@ final class VADProcessor: @unchecked Sendable {
         let endSilenceFrames = configuration.frames(in: configuration.endOfSpeechSilence)
         let preRollSamples = configuration.samples(in: configuration.preSpeechPadding)
         let maxUtteranceSamples = configuration.samples(in: configuration.maxUtteranceDuration)
+        let partialFrameCount: Int? = configuration.partialTranscriptionInterval.map {
+            configuration.frames(in: $0)
+        }
 
         var mode: Mode = .idle
         var preRoll = PreRoll(capacity: preRollSamples)
         var utterance: [Float] = []
         utterance.reserveCapacity(maxUtteranceSamples)
+        var currentUtteranceID: UUID?
+        var framesSinceLastPartial = 0
 
         while !Task.isCancelled {
             if ringBuffer.availableToRead < frameSamples {
@@ -115,8 +125,11 @@ final class VADProcessor: @unchecked Sendable {
                 if isSpeech {
                     let next = frames + 1
                     if next >= minSpeechFrames {
+                        let id = UUID()
+                        currentUtteranceID = id
+                        framesSinceLastPartial = 0
                         mode = .speaking
-                        continuation.yield(.utteranceStarted)
+                        continuation.yield(.utteranceStarted(utteranceID: id))
                     } else {
                         mode = .pendingSpeech(frames: next)
                     }
@@ -130,11 +143,20 @@ final class VADProcessor: @unchecked Sendable {
 
             case .speaking:
                 utterance.append(contentsOf: UnsafeBufferPointer(start: frameBuffer.baseAddress, count: frameSamples))
+                maybeEmitPartial(
+                    partialFrameCount: partialFrameCount,
+                    framesSinceLastPartial: &framesSinceLastPartial,
+                    utteranceID: currentUtteranceID,
+                    utterance: utterance,
+                    continuation: continuation
+                )
                 if !isSpeech {
                     mode = .pendingSilence(silenceFrames: 1)
                 }
                 if utterance.count >= maxUtteranceSamples {
-                    emit(utterance: &utterance, continuation: continuation)
+                    emit(utterance: &utterance, utteranceID: currentUtteranceID, continuation: continuation)
+                    currentUtteranceID = nil
+                    framesSinceLastPartial = 0
                     mode = .idle
                     model.reset()
                     preRoll.reset()
@@ -142,12 +164,21 @@ final class VADProcessor: @unchecked Sendable {
 
             case .pendingSilence(let silenceFrames):
                 utterance.append(contentsOf: UnsafeBufferPointer(start: frameBuffer.baseAddress, count: frameSamples))
+                maybeEmitPartial(
+                    partialFrameCount: partialFrameCount,
+                    framesSinceLastPartial: &framesSinceLastPartial,
+                    utteranceID: currentUtteranceID,
+                    utterance: utterance,
+                    continuation: continuation
+                )
                 if isSpeech {
                     mode = .speaking
                 } else {
                     let next = silenceFrames + 1
                     if next >= endSilenceFrames {
-                        emit(utterance: &utterance, continuation: continuation)
+                        emit(utterance: &utterance, utteranceID: currentUtteranceID, continuation: continuation)
+                        currentUtteranceID = nil
+                        framesSinceLastPartial = 0
                         mode = .idle
                         model.reset()
                         preRoll.reset()
@@ -160,11 +191,35 @@ final class VADProcessor: @unchecked Sendable {
         }
     }
 
-    private static func emit(utterance: inout [Float], continuation: AsyncStream<VADEvent>.Continuation) {
+    private static func emit(
+        utterance: inout [Float],
+        utteranceID: UUID?,
+        continuation: AsyncStream<VADEvent>.Continuation
+    ) {
+        defer { utterance.removeAll(keepingCapacity: true) }
+        guard let id = utteranceID else { return }
         let samples = utterance
         let duration = Duration.seconds(Double(samples.count) / AudioFormat.sampleRate)
-        continuation.yield(.utteranceEnded(samples: samples, duration: duration))
-        utterance.removeAll(keepingCapacity: true)
+        continuation.yield(.utteranceEnded(utteranceID: id, samples: samples, duration: duration))
+    }
+
+    /// Counts one more frame toward the next partial tick; when the
+    /// threshold is reached, snapshots the in-progress utterance and
+    /// yields a `.utteranceProgress` event. Swift's COW keeps the
+    /// snapshot cheap until the next append mutates `utterance`.
+    private static func maybeEmitPartial(
+        partialFrameCount: Int?,
+        framesSinceLastPartial: inout Int,
+        utteranceID: UUID?,
+        utterance: [Float],
+        continuation: AsyncStream<VADEvent>.Continuation
+    ) {
+        guard let partialFrameCount, let id = utteranceID else { return }
+        framesSinceLastPartial += 1
+        guard framesSinceLastPartial >= partialFrameCount else { return }
+        framesSinceLastPartial = 0
+        let duration = Duration.seconds(Double(utterance.count) / AudioFormat.sampleRate)
+        continuation.yield(.utteranceProgress(utteranceID: id, samples: utterance, duration: duration))
     }
 }
 
