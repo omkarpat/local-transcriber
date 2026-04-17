@@ -12,9 +12,12 @@ final class AudioCaptureDebugModel {
     let manager = AudioCaptureManager()
     @ObservationIgnored private var vad: VADProcessor?
     @ObservationIgnored private var eventTask: Task<Void, Never>?
+    @ObservationIgnored private var transcriptTask: Task<Void, Never>?
+    @ObservationIgnored private var transcriber: MoonshineTranscriber?
     @ObservationIgnored private let log = Logger(subsystem: "com.omkarpatil.VoxLocal", category: "DebugView")
 
     var isRunning = false
+    var isLoadingModels = false
     var rms: Float = 0
     var probability: Float = 0
     var vadState: DebugVADState = .idle
@@ -24,6 +27,7 @@ final class AudioCaptureDebugModel {
     var lastUtteranceDuration: Duration = .zero
     var lastUtterancePath: String?
     var errorMessage: String?
+    var transcripts: [TranscriptUpdate] = []   // most recent first
 
     func toggle() async {
         if isRunning {
@@ -35,6 +39,7 @@ final class AudioCaptureDebugModel {
 
     private func start() async {
         do {
+            try await ensureTranscriber()
             try await manager.start()
             let vad = VADProcessor(ringBuffer: manager.ringBuffer)
             self.vad = vad
@@ -57,6 +62,9 @@ final class AudioCaptureDebugModel {
         vadState = .idle
         probability = 0
         isRunning = false
+        // Keep `transcriber`, `transcriptTask`, and `transcripts` across
+        // start/stop cycles — no point reloading the 2s model every time,
+        // and the user likely wants to keep reading the history.
     }
 
     private func subscribe(to events: AsyncStream<VADEvent>) {
@@ -66,6 +74,39 @@ final class AudioCaptureDebugModel {
                 guard let self else { return }
                 await MainActor.run {
                     self.apply(event)
+                }
+            }
+        }
+    }
+
+    private func ensureTranscriber() async throws {
+        if transcriber != nil { return }
+        isLoadingModels = true
+        defer { isLoadingModels = false }
+        // Session loads do ~2s of file I/O + CoreML graph setup. Never on
+        // the main actor — CoreAudio and the ORT runtime both fire "This
+        // method should not be called on the main thread" warnings
+        // otherwise. Task.detached hops to a cooperative background thread.
+        let t = try await Task.detached(priority: .userInitiated) { () -> MoonshineTranscriber in
+            let model = try MoonshineModel()
+            let tokenizer = try await MoonshineTokenizer.load()
+            return MoonshineTranscriber(model: model, tokenizer: tokenizer)
+        }.value
+        transcriber = t
+        subscribeToTranscripts(t)
+    }
+
+    private func subscribeToTranscripts(_ t: MoonshineTranscriber) {
+        transcriptTask?.cancel()
+        transcriptTask = Task { [weak self] in
+            for await update in t.updates {
+                guard let self else { return }
+                await MainActor.run {
+                    // Newest first, cap history so the view doesn't grow unbounded.
+                    self.transcripts.insert(update, at: 0)
+                    if self.transcripts.count > 20 {
+                        self.transcripts.removeLast(self.transcripts.count - 20)
+                    }
                 }
             }
         }
@@ -84,6 +125,7 @@ final class AudioCaptureDebugModel {
             utteranceCount += 1
             lastUtteranceDuration = duration
             dumpUtterance(samples: samples)
+            transcriber?.enqueue(samples: samples, duration: duration)
         case .error(let message):
             errorMessage = message
         }
@@ -144,11 +186,21 @@ struct AudioCaptureDebugView: View {
             .font(.system(.footnote, design: .monospaced))
             .padding(.horizontal)
 
-            Button(model.isRunning ? "Stop" : "Start") {
-                Task { await model.toggle() }
+            HStack(spacing: 12) {
+                Button(model.isRunning ? "Stop" : "Start") {
+                    Task { await model.toggle() }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .disabled(model.isLoadingModels)
+
+                if model.isLoadingModels {
+                    ProgressView()
+                    Text("Loading ASR models…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.large)
 
             if let message = model.errorMessage {
                 Text(message)
@@ -157,6 +209,8 @@ struct AudioCaptureDebugView: View {
                     .multilineTextAlignment(.center)
                     .padding(.horizontal)
             }
+
+            transcriptList
         }
         .padding()
         .task {
@@ -164,6 +218,38 @@ struct AudioCaptureDebugView: View {
                 model.refreshCaptureMetrics()
                 try? await Task.sleep(for: .milliseconds(50))
             }
+        }
+    }
+
+    @ViewBuilder
+    private var transcriptList: some View {
+        if model.transcripts.isEmpty {
+            Text("Transcripts will appear here as utterances finish.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal)
+        } else {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Transcripts (newest first)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(model.transcripts) { t in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(t.text.isEmpty ? "(empty)" : t.text)
+                                    .font(.body)
+                                Text("\(format(duration: t.utteranceDuration))  ·  \(String(format: "RTF %.2f", t.realTimeFactor))  ·  \(t.tokenCount) tok")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                }
+                .frame(maxHeight: 180)
+            }
+            .padding(.horizontal)
         }
     }
 

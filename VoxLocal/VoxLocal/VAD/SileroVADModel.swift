@@ -17,7 +17,10 @@ enum SileroVADError: Error {
 /// - Output `stateN` Float32[2, 1, 128]  (feed back as `state` next call)
 ///
 /// Not thread-safe. Intended for use on a single consumer task.
-final class SileroVADModel: @unchecked Sendable {
+/// `nonisolated` so `VADProcessor.Task.detached` can construct and drive
+/// it on a background thread without hopping back to MainActor. Without
+/// this, every ORT session op fires CoreAudio's "main thread" warning.
+nonisolated final class SileroVADModel: @unchecked Sendable {
     static let frameSamples = 512
     private static let contextSamples = 64
     private static let totalInputSamples = frameSamples + contextSamples
