@@ -17,6 +17,9 @@ struct ContentView: View {
                 Button("Run ONNX Smoke Test") {
                     SmokeTest.runSileroVADLoadTest()
                 }
+                Button("Run VAD Sanity Inference") {
+                    SmokeTest.runSileroVADInferenceSanity()
+                }
             }
             .navigationTitle("VoxLocal")
         }

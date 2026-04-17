@@ -23,8 +23,14 @@
   - `Views/AudioCaptureDebugView.swift` + `ContentView.swift` — NavigationStack entry with live level bar, Written/Drained/Overflow counters; debug view drains the ring buffer every 50ms so overflow stays at 0 end-to-end
   - `NSMicrophoneUsageDescription` added via `INFOPLIST_KEY_*` in both Debug and Release build configs (project uses `GENERATE_INFOPLIST_FILE = YES`, no file-based plist)
   - Verified on iPhone 17 Pro simulator: RMS responds to mic, Written grows at 16kHz, Drained tracks it, Overflow stays at 0
-- [ ] **Task 3** — Silero VAD Integration (next up)
-- [ ] **Task 4** — Moonshine ASR Integration
+- [x] **Task 3** — Silero VAD Integration
+  - `VAD/VADConfiguration.swift` — thresholds and durations (speech threshold 0.5, min speech 250ms, end-of-speech silence 700ms, pre-speech padding 300ms, max utterance 30s). Uses Swift's `Duration` type with integer sample/frame conversions.
+  - `VAD/SileroVADModel.swift` — ONNX wrapper for Silero VAD v5. Manages three persistent tensors: recurrent state `Float32[2,1,128]`, 64-sample context, and Int64 sample rate. Per-call input is `[64 context + 512 new] = 576 samples` at shape `[1, 576]`. CoreML EP on by default, CPU-only fallback available for diagnostics.
+  - `Utilities/WAVWriter.swift` — writes Float32 mono samples to 16kHz 16-bit PCM WAV in the app's Documents folder (for offline Moonshine debugging in Task 4).
+  - `VAD/VADProcessor.swift` — detached `Task` consumer loop that reads 512-sample frames from the `CircularAudioBuffer`, runs `SileroVADModel`, and implements an idle → pendingSpeech → speaking → pendingSilence state machine. Pre-roll buffer holds the last 300ms so word onsets aren't clipped. Events fan out via `AsyncStream<VADEvent>`.
+  - `Views/AudioCaptureDebugView.swift` extended — speech probability bar + color-coded state pill (gray/orange/green), utterance count, last utterance duration and filename. Subscribes to the VAD event stream on a `Task`; each `utteranceEnded` event writes a WAV.
+  - Verified on iPhone 17 Pro simulator: probability cycles 1.0 during speech / <0.02 in silence, state pill cycles through IDLE → LISTENING → SPEAKING → IDLE, utterances close cleanly after ~700ms of silence, WAVs land in Documents, ring-buffer overflow stays at 0.
+- [ ] **Task 4** — Moonshine ASR Integration (next up)
 - [ ] **Task 5** — Transcription Pipeline Orchestrator
 - [ ] **Task 6** — Minimal Transcription UI
 - [ ] **Task 7** — Physical Device Testing & Battery Profiling
@@ -41,6 +47,10 @@
 - Task 2 AVAudioSession mode is `.measurement` rather than `.default`. Rationale: `.measurement` disables iOS's default speech-processing chain (AGC, noise suppression) so the VAD / ASR see the raw mic signal.
 - Task 2 format conversion: the hardware mic runs at 48kHz (or the route's native rate); requesting 16kHz on `AVAudioSession.preferredSampleRate` is a hint only and often overridden. The tap is installed at hardware rate, `AVAudioConverter` does the 48→16kHz / stereo→mono conversion per-buffer inside the tap. Pre-allocated output buffer, no allocations in the hot path.
 - Task 2 physical-device testing (permission dialog, real mic routing, battery impact) deferred to Task 7 along with the rest of on-device verification.
+- Task 3 non-obvious finding: Silero VAD v5's ONNX export does **not** accept a bare 512-sample frame — it expects `[64 context + 512 new] = 576` samples per call, where the 64-sample context is the last 64 samples of the previous frame. The official `silero-vad` Python package hides this inside its `OnnxWrapper` class. Feeding only 512 samples makes the model silently return ~0.001 for everything, including clean speech. Our `SileroVADModel` now maintains the 64-sample context buffer alongside the LSTM state. Verified against Python ORT ground truth on JFK's inaugural speech (68% of frames cross 0.5 threshold).
+- Task 3 VAD warm-up: the LSTM state is zero on init; first ~6 frames (~200ms) of real speech may produce muted probability even after context fix is in place. Current design relies on the natural human-tap-to-speak delay (>500ms) to warm the model on ambient silence. Explicit init-time warm-up deferred unless Task 7 testing shows onset clipping.
+- Task 3 added `Utilities/WAVWriter.swift` as a debug-only side-channel: each detected utterance is dumped to `Documents/utterance-<ms>.wav`. Purpose is to have a corpus of real captured utterances to feed offline into Moonshine during Task 4 development (so we can iterate on ASR without re-recording each time).
+- Task 3 also added `OnnxRuntimeSetup.makeCPUSessionOptions()` and `SileroVADModel(useCoreML: Bool)` as diagnostic tooling (so we can force CPU-only inference when debugging CoreML EP issues). The normal path still uses CoreML EP.
 
 ---
 

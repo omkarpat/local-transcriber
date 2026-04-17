@@ -1,35 +1,45 @@
 import SwiftUI
+import os
+
+enum DebugVADState: String {
+    case idle = "idle"
+    case listening = "listening"
+    case speaking = "speaking"
+}
 
 @Observable
 final class AudioCaptureDebugModel {
     let manager = AudioCaptureManager()
+    @ObservationIgnored private var vad: VADProcessor?
+    @ObservationIgnored private var eventTask: Task<Void, Never>?
+    @ObservationIgnored private let log = Logger(subsystem: "com.omkarpatil.VoxLocal", category: "DebugView")
 
     var isRunning = false
     var rms: Float = 0
+    var probability: Float = 0
+    var vadState: DebugVADState = .idle
     var framesCaptured: Int = 0
-    var framesDrained: Int = 0
     var overflowSamples: Int = 0
+    var utteranceCount: Int = 0
+    var lastUtteranceDuration: Duration = .zero
+    var lastUtterancePath: String?
     var errorMessage: String?
-
-    @ObservationIgnored private let drainBufferCapacity = 4096
-    @ObservationIgnored private let drainBuffer: UnsafeMutableBufferPointer<Float>
-
-    init() {
-        drainBuffer = UnsafeMutableBufferPointer<Float>.allocate(capacity: 4096)
-    }
-
-    deinit {
-        drainBuffer.deallocate()
-    }
 
     func toggle() async {
         if isRunning {
-            manager.stop()
-            isRunning = false
+            stop()
             return
         }
+        await start()
+    }
+
+    private func start() async {
         do {
             try await manager.start()
+            let vad = VADProcessor(ringBuffer: manager.ringBuffer)
+            self.vad = vad
+            subscribe(to: vad.events)
+            vad.start()
             isRunning = true
             errorMessage = nil
         } catch {
@@ -38,18 +48,63 @@ final class AudioCaptureDebugModel {
         }
     }
 
-    func refreshMetrics() {
+    private func stop() {
+        vad?.stop()
+        vad = nil
+        eventTask?.cancel()
+        eventTask = nil
+        manager.stop()
+        vadState = .idle
+        probability = 0
+        isRunning = false
+    }
+
+    private func subscribe(to events: AsyncStream<VADEvent>) {
+        eventTask?.cancel()
+        eventTask = Task { [weak self] in
+            for await event in events {
+                guard let self else { return }
+                await MainActor.run {
+                    self.apply(event)
+                }
+            }
+        }
+    }
+
+    @MainActor
+    private func apply(_ event: VADEvent) {
+        switch event {
+        case .frame(let prob, let isSpeech):
+            probability = prob
+            if vadState == .idle && isSpeech { vadState = .listening }
+        case .utteranceStarted:
+            vadState = .speaking
+        case .utteranceEnded(let samples, let duration):
+            vadState = .idle
+            utteranceCount += 1
+            lastUtteranceDuration = duration
+            dumpUtterance(samples: samples)
+        case .error(let message):
+            errorMessage = message
+        }
+    }
+
+    private func dumpUtterance(samples: [Float]) {
+        let stamp = Int(Date().timeIntervalSince1970 * 1000)
+        let url = WAVWriter.documentsDirectory().appendingPathComponent("utterance-\(stamp).wav")
+        do {
+            try WAVWriter.write(samples: samples, to: url)
+            lastUtterancePath = url.lastPathComponent
+            log.info("Wrote utterance: \(url.path)")
+        } catch {
+            log.error("WAV write failed: \(error)")
+        }
+    }
+
+    func refreshCaptureMetrics() {
         rms = manager.currentRMS
         framesCaptured = manager.framesCaptured
         overflowSamples = manager.ringBuffer.overflowSamples
-
-        // Debug drain: pretend to be the VAD consumer so overflow stays at 0.
-        // Replaced by VADProcessor in Task 3.
-        while true {
-            let n = manager.ringBuffer.read(into: drainBuffer.baseAddress!, maxCount: drainBufferCapacity)
-            if n == 0 { break }
-            framesDrained += n
-        }
     }
 }
 
@@ -57,22 +112,36 @@ struct AudioCaptureDebugView: View {
     @State private var model = AudioCaptureDebugModel()
 
     var body: some View {
-        VStack(spacing: 24) {
-            Text("Audio Capture")
+        VStack(spacing: 20) {
+            Text("Audio + VAD")
                 .font(.title2).bold()
 
-            LevelBar(level: model.rms)
-                .frame(height: 20)
-                .padding(.horizontal)
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Mic RMS").font(.caption).foregroundStyle(.secondary)
+                LevelBar(level: model.rms, color: .blue, scale: 4)
+                    .frame(height: 16)
+            }
+            .padding(.horizontal)
 
             VStack(alignment: .leading, spacing: 6) {
-                metricRow("RMS", value: String(format: "%.4f", model.rms))
-                metricRow("Written (16kHz)", value: "\(model.framesCaptured)")
-                metricRow("Drained", value: "\(model.framesDrained)")
-                metricRow("Seconds", value: String(format: "%.2f", Double(model.framesCaptured) / AudioFormat.sampleRate))
+                HStack {
+                    Text("Speech probability").font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    StatePill(state: model.vadState)
+                }
+                LevelBar(level: model.probability, color: .green, scale: 1)
+                    .frame(height: 16)
+            }
+            .padding(.horizontal)
+
+            VStack(alignment: .leading, spacing: 6) {
+                metricRow("Utterances", value: "\(model.utteranceCount)")
+                metricRow("Last duration", value: format(duration: model.lastUtteranceDuration))
+                metricRow("Last file", value: model.lastUtterancePath ?? "—")
+                metricRow("Captured (s)", value: String(format: "%.1f", Double(model.framesCaptured) / AudioFormat.sampleRate))
                 metricRow("Overflow", value: "\(model.overflowSamples)")
             }
-            .font(.system(.body, design: .monospaced))
+            .font(.system(.footnote, design: .monospaced))
             .padding(.horizontal)
 
             Button(model.isRunning ? "Stop" : "Start") {
@@ -92,7 +161,7 @@ struct AudioCaptureDebugView: View {
         .padding()
         .task {
             while !Task.isCancelled {
-                model.refreshMetrics()
+                model.refreshCaptureMetrics()
                 try? await Task.sleep(for: .milliseconds(50))
             }
         }
@@ -105,10 +174,39 @@ struct AudioCaptureDebugView: View {
             Text(value)
         }
     }
+
+    private func format(duration: Duration) -> String {
+        let seconds = Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
+        return String(format: "%.2fs", seconds)
+    }
+}
+
+private struct StatePill: View {
+    let state: DebugVADState
+
+    var body: some View {
+        Text(state.rawValue.uppercased())
+            .font(.caption2.weight(.semibold))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(background)
+            .foregroundStyle(.white)
+            .clipShape(Capsule())
+    }
+
+    private var background: Color {
+        switch state {
+        case .idle: return .gray
+        case .listening: return .orange
+        case .speaking: return .green
+        }
+    }
 }
 
 private struct LevelBar: View {
     let level: Float
+    let color: Color
+    let scale: Float
 
     var body: some View {
         GeometryReader { proxy in
@@ -116,8 +214,8 @@ private struct LevelBar: View {
                 RoundedRectangle(cornerRadius: 4)
                     .fill(.quaternary)
                 RoundedRectangle(cornerRadius: 4)
-                    .fill(.tint)
-                    .frame(width: proxy.size.width * CGFloat(min(max(level * 4, 0), 1)))
+                    .fill(color)
+                    .frame(width: proxy.size.width * CGFloat(min(max(level * scale, 0), 1)))
             }
         }
     }

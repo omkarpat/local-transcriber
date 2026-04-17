@@ -18,4 +18,9 @@ nonisolated enum OnnxRuntimeSetup {
         try options.appendCoreMLExecutionProvider(with: coreML)
         return options
     }
+
+    static func makeCPUSessionOptions() throws -> ORTSessionOptions {
+        _ = shared
+        return try ORTSessionOptions()
+    }
 }
