@@ -112,6 +112,7 @@ final class TranscriptionModel {
                 case .stopped:
                     self.isRunning = false
                     self.isSpeaking = false
+                    self.flattenPendingPartials()
                 case .failed(let message):
                     self.errorMessage = message
                     self.isRunning = false
@@ -120,6 +121,25 @@ final class TranscriptionModel {
                     self.isSpeaking = active
                 }
             }
+        }
+    }
+
+    /// Any `.partial` rows still visible when the pipeline stops belong to
+    /// an utterance VAD never closed (the user stopped mid-speech). Without
+    /// this, those rows stay italic/grey forever because no `.finalized`
+    /// is coming. Promote them to `.final` using the ASR's most recent
+    /// partial text — good enough for display, and if a late `.finalized`
+    /// or `.refined` eventually lands for the same utteranceID the existing
+    /// upsert logic will overwrite the row.
+    ///
+    /// Rebuilding the array (rather than mutating in place) so `@Observable`
+    /// reliably picks up the change and re-renders.
+    private func flattenPendingPartials() {
+        rows = rows.map { row in
+            guard case .partial = row.status else { return row }
+            var promoted = row
+            promoted.status = .final(tokenCount: 0, realTimeFactor: 0, isRefined: false)
+            return promoted
         }
     }
 
