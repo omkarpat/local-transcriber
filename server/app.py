@@ -4,12 +4,27 @@ Punctuation service — FastAPI + ONNX Runtime wrapper around
 token classification). Takes an unpunctuated transcript and returns
 punctuated + sentence-cased text.
 
-Runtime contract (see `punctuation-service-plan.md`):
+Runtime contract — V1 (see `punctuation-service-plan.md`):
 
     POST /punctuate
     Headers: X-API-Key: <PUNCTUATION_API_KEY>
     Body: {"text": "…"}
     Response 200: {"text": "…"}
+
+Runtime contract — V2 streaming (see `punctuation-service-v2-plan.md`):
+
+    POST /punctuate/stream
+    Headers: X-API-Key, Accept: text/event-stream
+    Body: {
+        "text": "…",
+        "utterance_id": "…",
+        "segment_id": "…",
+        "silence_before_ms": 2400   (optional, reserved)
+    }
+    Response: text/event-stream with one or more `event: stage` frames.
+    Each frame carries {utterance_id, segment_id, stage, text, final}.
+    Today only `stage: "punct_case"` is emitted; Stages 1 (commands) and
+    3 (ITN) will land as separate events as they ship.
 
 Model is loaded once at startup in the FastAPI lifespan hook so the first
 request doesn't eat the 1-2 s graph init cost. `/healthz` returns 503
@@ -18,6 +33,7 @@ until the model is ready so ALB won't route traffic to a cold task.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -29,6 +45,7 @@ from typing import Optional
 import numpy as np
 import onnxruntime as ort
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from tokenizers import Tokenizer
 
@@ -140,6 +157,20 @@ class PunctuateResponse(BaseModel):
     text: str
 
 
+class PunctuateStreamRequest(BaseModel):
+    """Request for the V2 streaming endpoint. See the V2 plan for the full
+    contract. `utterance_id` is provenance (which Moonshine utterance this
+    came from — used for retries). `segment_id` is the client's current
+    running rendering segment; the server echoes it back on every stage
+    event. `silence_before_ms` is an optional client-supplied VAD-derived
+    signal; reserved for Stage 1 paragraph-break heuristics, accepted but
+    not yet used."""
+    text: str
+    utterance_id: str
+    segment_id: str
+    silence_before_ms: int | None = None
+
+
 def _require_api_key(x_api_key: str = Header(..., alias="X-API-Key")) -> None:
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="invalid API key")
@@ -154,19 +185,81 @@ def healthz():
 
 @app.post("/punctuate", response_model=PunctuateResponse)
 def punctuate(req: PunctuateRequest, _: None = Depends(_require_api_key)) -> PunctuateResponse:
-    text = req.text
-    if not text:
-        return PunctuateResponse(text="")
-    if len(text) > MAX_INPUT_CHARS:
+    if len(req.text) > MAX_INPUT_CHARS:
         raise HTTPException(status_code=413, detail="input too long")
+    return PunctuateResponse(text=_run_v1_pipeline(req.text))
+
+
+def _run_v1_pipeline(text: str) -> str:
+    """V1 punct + case pipeline on already-length-validated text. Shared
+    between the non-streaming `/punctuate` endpoint and the streaming
+    `/punctuate/stream` endpoint so both paths produce identical output
+    for the same input."""
+    if not text:
+        return ""
     stripped = text.strip()
     if not stripped:
-        return PunctuateResponse(text="")
-
+        return ""
     words = stripped.split()
     labeled = _infer_labels(words)
     joined = _apply_punctuation(labeled)
-    return PunctuateResponse(text=_apply_casing(joined))
+    return _apply_casing(joined)
+
+
+def _sse(event: str, payload: dict) -> bytes:
+    """One SSE frame: `event:` line, `data:` line with JSON payload, blank
+    terminator. Bytes (not str) so the streaming generator can yield
+    without re-encoding."""
+    return f"event: {event}\ndata: {json.dumps(payload)}\n\n".encode()
+
+
+@app.post("/punctuate/stream")
+async def punctuate_stream(
+    req: PunctuateStreamRequest,
+    _: None = Depends(_require_api_key),
+):
+    """Streaming refinement endpoint. Today emits a single `stage:
+    "punct_case"` event wrapping the V1 output with `final: true`. As
+    Stage 1 (commands) and Stage 3 (ITN) land, they'll add events before
+    and after this one — clients should key on `stage` not event order.
+
+    Stateless: `segment_id` is echoed back verbatim. No new segment ids
+    are minted yet because splitting hasn't shipped; when it does, new
+    ids will be deterministic `uuidv5(utterance_id, split_index)` so
+    retries reproduce identical output.
+    """
+    if len(req.text) > MAX_INPUT_CHARS:
+        raise HTTPException(status_code=413, detail="input too long")
+
+    async def gen():
+        try:
+            # ONNX `session.run` is blocking; offload so the event loop
+            # can flush bytes between stages when there's more than one
+            # stage to emit (today still a single stage, but the pattern
+            # needs to be in place for Stages 1 and 3).
+            refined = await asyncio.to_thread(_run_v1_pipeline, req.text)
+            yield _sse("stage", {
+                "utterance_id": req.utterance_id,
+                "segment_id": req.segment_id,
+                "stage": "punct_case",
+                "text": refined,
+                "final": True,
+            })
+        except Exception as e:
+            log.exception("stream pipeline failed")
+            yield _sse("error", {"message": str(e)})
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            # Defeat proxy/ALB response buffering — without these the
+            # full body only arrives at EOF, which defeats streaming.
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 # ---------- Inference pipeline ----------------------------------------------
