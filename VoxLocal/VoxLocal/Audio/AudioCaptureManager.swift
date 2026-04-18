@@ -1,4 +1,4 @@
-import AVFoundation
+@preconcurrency import AVFoundation
 import Synchronization
 import os
 
@@ -12,7 +12,7 @@ enum AudioCaptureError: Error {
 /// Shared state between the main actor and the real-time audio tap thread.
 /// The tap closure must never touch the main actor, so this isolates everything
 /// the tap needs behind a `nonisolated`, `Sendable` reference.
-final class AudioTapState: @unchecked Sendable {
+nonisolated final class AudioTapState: @unchecked Sendable {
     let ringBuffer: CircularAudioBuffer
     let converter: AVAudioConverter
     let targetFormat: AVAudioFormat
@@ -84,7 +84,7 @@ final class AudioTapState: @unchecked Sendable {
     }
 }
 
-final class AudioCaptureManager {
+nonisolated final class AudioCaptureManager: @unchecked Sendable {
     let ringBuffer: CircularAudioBuffer
 
     private let engine = AVAudioEngine()

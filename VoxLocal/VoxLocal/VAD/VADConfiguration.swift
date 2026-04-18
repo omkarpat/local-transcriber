@@ -1,6 +1,6 @@
 import Foundation
 
-struct VADConfiguration: Sendable, Equatable {
+nonisolated struct VADConfiguration: Sendable, Equatable {
     /// Silero VAD output ≥ this value is treated as "speech present" in a frame.
     var speechThreshold: Float = 0.5
 
@@ -26,7 +26,7 @@ struct VADConfiguration: Sendable, Equatable {
     static let `default` = VADConfiguration()
 }
 
-extension VADConfiguration {
+nonisolated extension VADConfiguration {
     /// Frame size Silero VAD expects at 16kHz: 512 samples ≈ 32ms.
     static let frameSamples = 512
 

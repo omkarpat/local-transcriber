@@ -3,7 +3,7 @@ import Foundation
 /// Knobs the UI can set before calling `TranscriptionPipeline.start(...)`.
 /// Kept as a `Sendable` value type so it crosses actor boundaries for free
 /// and so SwiftUI `@Bindable` views can mutate copies locally.
-struct PipelineConfiguration: Sendable, Equatable {
+nonisolated struct PipelineConfiguration: Sendable, Equatable {
     /// Forwarded verbatim to the VAD. Covers thresholds, pre/post padding,
     /// partial-transcription cadence, and the max-utterance hard cap.
     var vad: VADConfiguration = .default

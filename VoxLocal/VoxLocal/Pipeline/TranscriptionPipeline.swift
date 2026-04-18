@@ -56,6 +56,14 @@ actor TranscriptionPipeline {
 
     private struct PendingPunctuation: Sendable {
         let utteranceID: UUID
+        /// The `segmentID` that was current when this utterance was first
+        /// dispatched. Retry replays with *this* value, not whatever the
+        /// session's current running segment has become in the meantime —
+        /// otherwise the server would derive different segment IDs on
+        /// retry and create orphan rows in the UI. For V2 single-segment
+        /// mode this equals `utteranceID`; it'll diverge once cross-
+        /// utterance segment state lands in Phase 3.
+        let segmentIDAtDispatch: UUID
         let text: String
         let utteranceDuration: Duration
     }
@@ -216,24 +224,32 @@ actor TranscriptionPipeline {
         }
     }
 
-    /// First-try punctuation for a freshly-finalized utterance. Detached
+    /// First-try refinement for a freshly-finalized utterance. Detached
     /// so multiple utterances can be in flight in parallel — the
-    /// happy-path RTT on localhost is ~80 ms, but real networks vary.
-    /// On failure, enqueue for the retry loop to pick up.
+    /// happy-path RTT on localhost is ~80 ms for the full V2 pipeline,
+    /// but real networks vary. On failure (stream ends without a `final`
+    /// event), enqueue for the retry loop to pick up.
     private func dispatchFirstTryPunctuation(for result: TranscriptResult) {
-        let client = punctuationClient
+        // V2 single-segment: the segment for every utterance is the
+        // utteranceID itself. When cross-utterance segment state lands
+        // (Phase 3 — "new paragraph" detection + silence-based breaks),
+        // capture `self.currentSegmentID` here instead. The `AtDispatch`
+        // naming reminds readers this is frozen at first-try time and
+        // must be reused verbatim on retry.
+        let dispatchSegmentID = result.utteranceID
+
         Task.detached { [weak self] in
-            let punctuated = await client.punctuate(
+            guard let self else { return }
+            let succeeded = await self.consumeRefinementStream(
                 utteranceID: result.utteranceID,
+                segmentID: dispatchSegmentID,
                 text: result.text,
                 utteranceDuration: result.utteranceDuration
             )
-            guard let self else { return }
-            if let punctuated {
-                await self.handleRefinementSuccess(punctuated)
-            } else {
+            if !succeeded {
                 await self.enqueueForRetry(
                     utteranceID: result.utteranceID,
+                    segmentIDAtDispatch: dispatchSegmentID,
                     text: result.text,
                     utteranceDuration: result.utteranceDuration
                 )
@@ -241,11 +257,58 @@ actor TranscriptionPipeline {
         }
     }
 
-    /// A refinement just landed. Publish it and — if we have a backlog —
-    /// kick an immediate drain, since we just confirmed the server is
-    /// reachable.
-    private func handleRefinementSuccess(_ r: TranscriptRefinement) {
+    /// Consume a refinement stream for one utterance. Yields each stage
+    /// event onto `updates` — intermediate stages via `emitRefinement`,
+    /// the terminal `final` event via `handleRefinementSuccess` (which
+    /// also kicks the retry drain since a successful completion means
+    /// the server is reachable). Returns `true` if the stream ended with
+    /// a `final` event, `false` otherwise (mid-stream drop, non-2xx,
+    /// stream exhausted without final).
+    private func consumeRefinementStream(
+        utteranceID: UUID,
+        segmentID: UUID,
+        text: String,
+        utteranceDuration: Duration
+    ) async -> Bool {
+        let start = ContinuousClock.now
+        var sawFinal = false
+        for await event in punctuationClient.punctuateStream(
+            utteranceID: utteranceID,
+            segmentID: segmentID,
+            text: text
+        ) {
+            let elapsed = ContinuousClock.now - start
+            let refinement = TranscriptRefinement(
+                id: UUID(),
+                utteranceID: event.utteranceID,
+                segmentID: event.segmentID,
+                text: event.text,
+                sourceText: text,
+                utteranceDuration: utteranceDuration,
+                roundTripDuration: elapsed
+            )
+            if event.isFinal {
+                sawFinal = true
+                handleRefinementSuccess(refinement)
+            } else {
+                emitRefinement(refinement)
+            }
+        }
+        return sawFinal
+    }
+
+    /// Yield a refinement onto `updates` without kicking the retry drain.
+    /// Intermediate stage events go through here — they're progress, not
+    /// completion signals.
+    private func emitRefinement(_ r: TranscriptRefinement) {
         updatesContinuation.yield(.refined(r))
+    }
+
+    /// A stream just completed with `final: true`. Publish the terminal
+    /// refinement and — if we have a backlog — kick an immediate drain,
+    /// since we just confirmed the server is reachable.
+    private func handleRefinementSuccess(_ r: TranscriptRefinement) {
+        emitRefinement(r)
         guard !pendingPunctuation.isEmpty else { return }
         retryTask?.cancel()
         retryTask = Task { [weak self] in
@@ -257,10 +320,16 @@ actor TranscriptionPipeline {
     /// a double-enqueue if a retry attempt fails while the first-try
     /// callback is still in flight). Starts the retry loop if not already
     /// running.
-    private func enqueueForRetry(utteranceID: UUID, text: String, utteranceDuration: Duration) {
+    private func enqueueForRetry(
+        utteranceID: UUID,
+        segmentIDAtDispatch: UUID,
+        text: String,
+        utteranceDuration: Duration
+    ) {
         if pendingPunctuation.contains(where: { $0.utteranceID == utteranceID }) { return }
         pendingPunctuation.append(PendingPunctuation(
             utteranceID: utteranceID,
+            segmentIDAtDispatch: segmentIDAtDispatch,
             text: text,
             utteranceDuration: utteranceDuration
         ))
@@ -304,25 +373,29 @@ actor TranscriptionPipeline {
         retryTask = nil
     }
 
-    /// Pop items off the front of the queue and punctuate them one at a
+    /// Pop items off the front of the queue and refine them one at a
     /// time until we hit a failure. Returns the count we got through —
-    /// zero means the server is still down.
+    /// zero means the server is still down. The refinement stream yields
+    /// intermediate stage events through `emitRefinement` while each
+    /// utterance is in flight; we only pop an item after its stream
+    /// completes successfully (final event received).
     private func drainAsManyAsPossible() async -> Int {
         var drained = 0
         while let next = pendingPunctuation.first {
             if Task.isCancelled { break }
-            let punctuated = await punctuationClient.punctuate(
+            let succeeded = await consumeRefinementStream(
                 utteranceID: next.utteranceID,
+                segmentID: next.segmentIDAtDispatch,
                 text: next.text,
                 utteranceDuration: next.utteranceDuration
             )
-            guard let punctuated else { break }
-            // Guard against the queue being mutated during the await.
-            // We only pop if the head is still the item we just sent.
+            guard succeeded else { break }
+            // Guard against the queue being mutated during the stream's
+            // awaits. We only pop if the head is still the item we just
+            // processed.
             if pendingPunctuation.first?.utteranceID == next.utteranceID {
                 pendingPunctuation.removeFirst()
             }
-            updatesContinuation.yield(.refined(punctuated))
             drained += 1
         }
         return drained

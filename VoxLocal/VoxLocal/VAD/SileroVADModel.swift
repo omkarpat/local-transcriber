@@ -107,7 +107,7 @@ nonisolated final class SileroVADModel: @unchecked Sendable {
             throw SileroVADError.unexpectedStateShape
         }
         stateNData.withUnsafeBytes { raw in
-            memcpy(stateData.mutableBytes, raw.baseAddress!, Self.stateByteCount)
+            _ = memcpy(stateData.mutableBytes, raw.baseAddress!, Self.stateByteCount)
         }
 
         // Save last 64 samples of this frame as the next call's context.
