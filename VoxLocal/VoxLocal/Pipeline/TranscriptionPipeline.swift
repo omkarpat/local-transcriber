@@ -43,6 +43,11 @@ actor TranscriptionPipeline {
     /// acceptable for Phase 1 (and matches the silent-fallback contract).
     private var pendingPunctuation: [PendingPunctuation] = []
     private var retryTask: Task<Void, Never>?
+    /// Monotonic counter identifying which drain loop currently owns
+    /// `retryTask`. A cancelled drain's end-of-loop cleanup only clears
+    /// `retryTask` if its epoch still matches — otherwise it would
+    /// clobber a newer drain's registration and leak orphaned tasks.
+    private var retryEpoch: Int = 0
 
     /// Smallest wait between retry attempts. Picked to feel responsive
     /// ("network back? within 5 s everything catches up") without
@@ -53,6 +58,14 @@ actor TranscriptionPipeline {
     /// Safety cap on the queue so a long outage doesn't balloon memory.
     /// At ~100-char transcripts this tops out around ~20 KB — cheap.
     private let maxPendingPunctuation = 100
+    /// How many consecutive "no progress" retry rounds we tolerate
+    /// before giving up and dropping the queue. With the current delay
+    /// schedule this is roughly 5 + 10 + 20 + 40 + 60 ≈ 2 min 15 s of
+    /// retrying after the server first stopped responding — long enough
+    /// to ride out a server crash-and-restart, short enough that a
+    /// truly dead server doesn't leak retries forever. Any partial
+    /// success (drained > 0) resets the counter.
+    private let maxConsecutiveNoProgress = 5
 
     private struct PendingPunctuation: Sendable {
         let utteranceID: UUID
@@ -157,6 +170,11 @@ actor TranscriptionPipeline {
         vadForwardTask?.cancel()
         vadForwardTask = nil
         manager.stop()
+        // Deliberately DO NOT cancel `retryTask` or clear
+        // `pendingPunctuation` here. If the server was flaky during the
+        // session, those utterances should still get refined when the
+        // server recovers — the drain loop has its own termination
+        // condition (see `drainLoop`) so it can't run forever.
         running = false
         eventsContinuation.yield(.stopped)
         log.info("pipeline stopped")
@@ -195,7 +213,9 @@ actor TranscriptionPipeline {
             log.error("VAD error: \(message, privacy: .public)")
             eventsContinuation.yield(.failed(message))
             // VAD has already torn down its loop; bring the rest of the
-            // stack to idle so the UI can reset cleanly.
+            // stack to idle so the UI can reset cleanly. Retries for
+            // already-finalized utterances keep running — same rationale
+            // as `stop()`.
             vad?.stop()
             vad = nil
             vadForwardTask?.cancel()
@@ -304,16 +324,22 @@ actor TranscriptionPipeline {
         updatesContinuation.yield(.refined(r))
     }
 
-    /// A stream just completed with `final: true`. Publish the terminal
-    /// refinement and — if we have a backlog — kick an immediate drain,
-    /// since we just confirmed the server is reachable.
+    /// A stream just completed with `final: true`. Publish the refinement
+    /// and — if there's a backlog and no drain is currently running —
+    /// kick a fresh one at zero delay since we just confirmed the server
+    /// is reachable.
+    ///
+    /// We deliberately do NOT cancel an in-progress drain here. Cancel
+    /// propagates into the drain's current `consumeRefinementStream`,
+    /// aborting a retry request that the server is already processing;
+    /// under continuous speech every success fires this, starving the
+    /// queue because pending items never finish a stream. A running
+    /// drain will pick up its next iteration on its own schedule (worst
+    /// case: the current `maxRetryDelay` sleep finishes first).
     private func handleRefinementSuccess(_ r: TranscriptRefinement) {
         emitRefinement(r)
-        guard !pendingPunctuation.isEmpty else { return }
-        retryTask?.cancel()
-        retryTask = Task { [weak self] in
-            await self?.drainLoop(initialDelay: .zero)
-        }
+        guard retryTask == nil, !pendingPunctuation.isEmpty else { return }
+        startDrainLoop(initialDelay: .zero)
     }
 
     /// Stash a failed request. Idempotent per utteranceID (guards against
@@ -343,16 +369,31 @@ actor TranscriptionPipeline {
 
     private func ensureRetryLoop() {
         guard retryTask == nil else { return }
+        startDrainLoop(initialDelay: minRetryDelay)
+    }
+
+    /// Mint a fresh `retryEpoch` and spawn a drain task tagged with it.
+    /// Only the drain whose epoch is still current may nil out
+    /// `retryTask` at the end of its loop.
+    private func startDrainLoop(initialDelay: Duration) {
+        retryEpoch += 1
+        let epoch = retryEpoch
         retryTask = Task { [weak self] in
-            await self?.drainLoop(initialDelay: self?.minRetryDelay ?? .seconds(5))
+            await self?.drainLoop(initialDelay: initialDelay, epoch: epoch)
         }
     }
 
-    /// Keeps retrying until the queue drains or the owning actor goes
-    /// away. `initialDelay` lets the happy-path-recovered case (server
-    /// just answered) skip straight to a drain without waiting 5 s.
-    private func drainLoop(initialDelay: Duration) async {
+    /// Keeps retrying until the queue drains, the actor goes away, or
+    /// we hit the no-progress streak ceiling (see
+    /// `maxConsecutiveNoProgress`). `initialDelay` lets the
+    /// happy-path-recovered case (server just answered) skip straight to
+    /// a drain without waiting 5 s. `epoch` identifies this specific
+    /// drain — only the current-epoch drain is allowed to clear
+    /// `retryTask` on exit, so a cancelled drain's late cleanup can't
+    /// clobber a newer drain's registration.
+    private func drainLoop(initialDelay: Duration, epoch: Int) async {
         var delay = initialDelay
+        var noProgressStreak = 0
         while !Task.isCancelled && !pendingPunctuation.isEmpty {
             if delay > .zero {
                 do { try await Task.sleep(for: delay) }
@@ -362,15 +403,23 @@ actor TranscriptionPipeline {
             if pendingPunctuation.isEmpty { break }
             if drained > 0 {
                 // Made partial progress — server is flaky but responding.
-                // Keep the pressure on at min delay.
+                // Reset the streak and keep the pressure on at min delay.
                 delay = minRetryDelay
+                noProgressStreak = 0
             } else {
-                // Zero progress — back off.
+                noProgressStreak += 1
+                if noProgressStreak >= maxConsecutiveNoProgress {
+                    log.info("punctuation retry giving up after \(noProgressStreak, privacy: .public) failed rounds; dropping \(self.pendingPunctuation.count, privacy: .public) pending")
+                    pendingPunctuation.removeAll()
+                    break
+                }
                 delay = (delay == .zero) ? minRetryDelay : min(delay * 2, maxRetryDelay)
-                log.info("punctuation retry backing off to \(String(describing: delay), privacy: .public); \(self.pendingPunctuation.count, privacy: .public) pending")
+                log.info("punctuation retry backing off to \(String(describing: delay), privacy: .public); \(self.pendingPunctuation.count, privacy: .public) pending (attempt \(noProgressStreak, privacy: .public)/\(self.maxConsecutiveNoProgress, privacy: .public))")
             }
         }
-        retryTask = nil
+        if retryEpoch == epoch {
+            retryTask = nil
+        }
     }
 
     /// Pop items off the front of the queue and refine them one at a
