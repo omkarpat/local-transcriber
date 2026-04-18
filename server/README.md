@@ -5,11 +5,12 @@ transcripts to for punctuation + sentence casing + inverse text
 normalization. Two endpoints:
 
 - `POST /punctuate` — V1, single JSON response. Just punct + case.
-- `POST /punctuate/stream` — V2, Server-Sent Events. Emits a `punct_case`
-  stage then an `itn` stage (inverse text normalization, e.g.
-  "ten dollars" → "$10", "twenty twenty seven" → "2027"). Stage 1
-  spoken-command detection will be added later. Clients render text
-  progressively as each stage event arrives.
+- `POST /punctuate/stream` — V2, Server-Sent Events. Three stages:
+  `commands` (strip ASR-supplied punctuation + substitute spoken
+  commands like "comma"/"period"/"question mark"), `punct_case` (model
+  + regex casing), `itn` (inverse text normalization, e.g. "ten
+  dollars" → "$10", "twenty twenty seven" → "2027"). Clients render
+  text progressively as each stage event arrives.
 
 Punctuation model:
 [`oliverguhr/fullstop-punctuation-multilingual-base`](https://huggingface.co/oliverguhr/fullstop-punctuation-multilingual-base)
@@ -66,19 +67,22 @@ curl -s -X POST http://127.0.0.1:8000/punctuate \
   -d '{"text": "hello world how are you"}'
 # -> {"text": "Hello world how are you?"}
 
-# V2 (SSE streaming, two stages):
+# V2 (SSE streaming, three stages):
 curl -sN -X POST http://127.0.0.1:8000/punctuate/stream \
   -H 'Content-Type: application/json' \
   -H 'Accept: text/event-stream' \
   -H 'X-API-Key: dev-key-change-me' \
-  -d '{"text": "send me ten dollars by twenty twenty seven",
+  -d '{"text": "send me ten dollars comma by twenty twenty seven",
        "utterance_id": "a1111111-1111-1111-1111-111111111111",
        "segment_id":   "a1111111-1111-1111-1111-111111111111"}'
 # event: stage
-# data: {..., "stage": "punct_case", "text": "Send me ten dollars by twenty twenty seven.", "final": false}
+# data: {..., "stage": "commands",  "text": "send me ten dollars, by twenty twenty seven", "final": false}
 #
 # event: stage
-# data: {..., "stage": "itn",        "text": "Send me $10 by 2027.",                        "final": true}
+# data: {..., "stage": "punct_case", "text": "Send me ten dollars, by twenty twenty seven.", "final": false}
+#
+# event: stage
+# data: {..., "stage": "itn",        "text": "Send me $10, by 2027.",                       "final": true}
 ```
 
 Then ⌘R in Xcode; the iOS app defaults to `http://127.0.0.1:8000` and
@@ -121,6 +125,31 @@ Environment variables:
   compiled WFST grammars. Persist this across restarts to avoid the
   ~1–2 s cold-start grammar compilation cost.
 - `ITN_LANG` (default `en`) — NeMo ITN language code
+
+## Tests
+
+Pytest-driven. Unit tests for Stage 1 (`commands.py`) run in milliseconds
+and don't need the model; integration tests load the ONNX model + NeMo
+ITN once per session (~3–5 s cold start).
+
+```bash
+pip install -r requirements-dev.txt   # once
+
+# Fast unit tests only:
+pytest -m "not model"
+
+# Everything (unit + pipeline integration):
+pytest
+
+# Just the pipeline integration tests:
+pytest -m model
+```
+
+The pipeline tests include exact-match snapshots on representative
+inputs (`test_pipeline.py::TestRegressionSnapshots`). Any change to a
+stage that shifts user-visible output will flag those — eyeball the
+new output, then update the expected strings if the new behavior is
+desired.
 
 ## Operational notes (from the service plan)
 

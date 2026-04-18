@@ -1,0 +1,157 @@
+"""Unit tests for `commands.py` (Stage 1 of the V2 pipeline).
+
+Pure functions — no model load required. Run these on every change to
+the command detector as a cheap regression gate."""
+
+from __future__ import annotations
+
+import pytest
+
+from commands import (
+    apply_spoken_commands,
+    strip_asr_punctuation,
+)
+
+
+class TestStripAsrPunctuation:
+    @pytest.mark.parametrize(
+        "raw, expected",
+        [
+            ("hello, world", "hello world"),
+            ("hello. world", "hello world"),
+            ("what? now", "what now"),
+            ("no! way", "no way"),
+            ("wait: then", "wait then"),
+            ("wait; then", "wait then"),
+            ('she said "hi"', "she said hi"),
+            # Word-internal marks preserved.
+            ("don't strip", "don't strip"),
+            ("co-op", "co-op"),
+            # No-ops.
+            ("clean text", "clean text"),
+            ("", ""),
+        ],
+    )
+    def test_strip(self, raw: str, expected: str) -> None:
+        assert strip_asr_punctuation(raw) == expected
+
+
+class TestBasicSubstitution:
+    """Happy-path: each command appears in an unambiguous context and fires."""
+
+    @pytest.mark.parametrize(
+        "raw, expected",
+        [
+            ("hello comma how are you", "hello, how are you"),
+            ("send me ten dollars period", "send me ten dollars."),
+            ("is this working question mark", "is this working?"),
+            ("yes exclamation point", "yes!"),
+            ("we are done full stop", "we are done."),
+            ("this is it colon and then", "this is it: and then"),
+            ("wait semicolon then go", "wait; then go"),
+        ],
+    )
+    def test_punct_commands(self, raw: str, expected: str) -> None:
+        assert apply_spoken_commands(raw) == expected
+
+    def test_layout_commands_deferred(self) -> None:
+        """Layout commands (`new paragraph`, `new line`) are a no-op in
+        Commit 1. They'll fire in Commit 2 as segment splits rather than
+        in-text `\\n\\n` — which the current Stage 2 tokenizer would drop
+        on `str.split()` anyway. Until then the phrase survives as
+        literal words and Stage 2 gets to decide how to punctuate them."""
+        assert apply_spoken_commands("new paragraph hi") == "new paragraph hi"
+        assert apply_spoken_commands("line one new line line two") == (
+            "line one new line line two"
+        )
+
+
+class TestLiteralContexts:
+    """Command words used literally should NOT be substituted."""
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "use a comma here to make it clearer",
+            "the period of history was interesting",
+            "place a dash between those two dates",
+        ],
+    )
+    def test_preceded_by_article(self, raw: str) -> None:
+        result = apply_spoken_commands(raw)
+        # None of the punctuation marks should have been inserted.
+        for mark in (",", ".", ":", ";", "—", "?", "!"):
+            assert mark not in result, f"{mark!r} leaked into {result!r}"
+        # The literal word should survive.
+        original_tokens = raw.split()
+        for tok in ("comma", "period", "dash"):
+            if tok in original_tokens:
+                assert tok in result.split()
+
+
+class TestHighConfidenceCommands:
+    """`question mark`, `exclamation point` should fire even mid-sentence —
+    they're almost never literal in dictation."""
+
+    def test_question_mark_mid_sentence(self) -> None:
+        # "Does this work question mark and if so…" — question mark fires.
+        result = apply_spoken_commands("does this work question mark and if so do that")
+        assert "?" in result
+
+    def test_exclamation_point_mid_sentence(self) -> None:
+        result = apply_spoken_commands("amazing exclamation point look at this")
+        assert "!" in result
+
+
+class TestShortUtterances:
+    """≤2 tokens: whatever matches fires, regardless of article rule."""
+
+    @pytest.mark.parametrize(
+        "raw, expected",
+        [
+            ("period", "."),
+            ("comma", ","),
+            ("full stop", "."),
+            ("question mark", "?"),
+        ],
+    )
+    def test_standalone(self, raw: str, expected: str) -> None:
+        assert apply_spoken_commands(raw) == expected
+
+
+class TestAsrPunctuationOverlap:
+    """Scenarios where the ASR supplies punctuation on top of speech."""
+
+    def test_asr_comma_stripped(self) -> None:
+        # Strip happens before detection; no command word present →
+        # output is clean, model fills in later.
+        assert apply_spoken_commands("hello, how are you") == "hello how are you"
+
+    def test_asr_punct_plus_redundant_command(self) -> None:
+        # ASR inserted a comma AND user said "comma". Strip removes the
+        # ASR comma, command inserts one back. Net: single comma, no dupe.
+        assert apply_spoken_commands("hello, comma how are you") == "hello, how are you"
+
+    def test_asr_period_end_stripped(self) -> None:
+        # ASR-style trailing period is stripped; model backfills in stage 2.
+        assert apply_spoken_commands("hello world.") == "hello world"
+
+
+class TestEdgeCases:
+    def test_empty_string(self) -> None:
+        assert apply_spoken_commands("") == ""
+
+    def test_whitespace_only(self) -> None:
+        # Whitespace-only passes through untouched (nothing to do).
+        assert apply_spoken_commands("   ") == "   "
+
+    def test_single_word_not_command(self) -> None:
+        assert apply_spoken_commands("hello") == "hello"
+
+    def test_multi_word_command_greedy(self) -> None:
+        # "full stop" should match as a 2-token command, not "full" + "stop".
+        assert apply_spoken_commands("done full stop") == "done."
+
+    def test_command_at_utterance_start(self) -> None:
+        # Leading command gets prepended standalone (rare edge case).
+        assert apply_spoken_commands("comma then continue") == ", then continue"
