@@ -86,32 +86,46 @@ nonisolated final class PunctuationClient: @unchecked Sendable {
                     }
 
                     // SSE parser: fields are newline-delimited; a blank
-                    // line dispatches the buffered event. Anything other
-                    // than `event: stage` gets silently discarded — the
-                    // client's contract is silent fallback on the UI side,
-                    // so unknown events and errors just end the stream
-                    // without emitting.
+                    // line *or* stream close dispatches the buffered
+                    // event. Anything other than `event: stage` gets
+                    // silently discarded — the client's contract is
+                    // silent fallback on the UI side.
+                    //
+                    // Why stream-close also dispatches: `URLSession.AsyncBytes.lines`
+                    // does not reliably emit a trailing empty line for a
+                    // body ending in `\n\n`, so relying purely on the
+                    // blank-line trigger loses the last event (which for
+                    // a single-stage stream is *the* final event). Dispatch
+                    // on EOF is slightly stricter than SSE spec but matches
+                    // real-world server behavior and every SSE client I've
+                    // seen in the wild.
                     var currentEvent = "message"
                     var dataBuffer = ""
+
+                    func flushBufferedEvent() -> Bool {
+                        defer {
+                            currentEvent = "message"
+                            dataBuffer = ""
+                        }
+                        guard !dataBuffer.isEmpty else { return false }
+                        if currentEvent == "stage",
+                           let event = Self.decodeStage(dataBuffer) {
+                            continuation.yield(event)
+                            return event.isFinal
+                        } else if currentEvent == "error" {
+                            log.error("server stream error: \(dataBuffer, privacy: .public)")
+                        }
+                        return false
+                    }
 
                     for try await line in bytes.lines {
                         if Task.isCancelled { break }
 
                         if line.isEmpty {
-                            if !dataBuffer.isEmpty {
-                                if currentEvent == "stage",
-                                   let event = Self.decodeStage(dataBuffer) {
-                                    continuation.yield(event)
-                                    if event.isFinal {
-                                        continuation.finish()
-                                        return
-                                    }
-                                } else if currentEvent == "error" {
-                                    log.error("server stream error: \(dataBuffer, privacy: .public)")
-                                }
+                            if flushBufferedEvent() {
+                                continuation.finish()
+                                return
                             }
-                            currentEvent = "message"
-                            dataBuffer = ""
                             continue
                         }
 
@@ -131,6 +145,10 @@ nonisolated final class PunctuationClient: @unchecked Sendable {
                             }
                         }
                     }
+
+                    // Connection closed. Dispatch any pending event the
+                    // server emitted without a trailing blank line.
+                    _ = flushBufferedEvent()
                 } catch {
                     log.error("stream read failed: \(String(describing: error), privacy: .public)")
                 }
