@@ -290,8 +290,11 @@ def _stage_itn(text: str) -> str:
     where the ASR happened to spell numbers out."""
     if not text or _itn is None:
         return text
+    pre = _digits_to_words(text)
+    if pre != text:
+        log.info("d2w: %r -> %r", text, pre)
     try:
-        normalized = _itn.inverse_normalize(_digits_to_words(text), verbose=False)
+        normalized = _itn.inverse_normalize(pre, verbose=False)
     except Exception:
         log.exception("ITN failed on %r; passing through unchanged", text)
         return text
@@ -330,6 +333,11 @@ async def punctuate_stream(
     if len(req.text) > MAX_INPUT_CHARS:
         raise HTTPException(status_code=413, detail="input too long")
 
+    # Short prefix of the utterance id for log correlation — full UUIDs
+    # are noisy and the prefix is unique enough within a session.
+    utter_tag = (req.utterance_id or "")[:8]
+    log.info("stream utter=%s in=%r", utter_tag, req.text)
+
     async def gen():
         try:
             # Stage 2: punct + case. Blocking ONNX call → asyncio.to_thread
@@ -337,6 +345,7 @@ async def punctuate_stream(
             # starts. Without offloading, the whole response would arrive
             # together at EOF, defeating the streaming.
             refined = await asyncio.to_thread(_run_v1_pipeline, req.text)
+            log.info("stream utter=%s stage=punct_case text=%r", utter_tag, refined)
             yield _sse("stage", {
                 "utterance_id": req.utterance_id,
                 "segment_id": req.segment_id,
@@ -349,6 +358,7 @@ async def punctuate_stream(
             # typical utterances) but still CPU-bound; offload so it doesn't
             # block the event loop for concurrent streams.
             normalized = await asyncio.to_thread(_stage_itn, refined)
+            log.info("stream utter=%s stage=itn text=%r", utter_tag, normalized)
             yield _sse("stage", {
                 "utterance_id": req.utterance_id,
                 "segment_id": req.segment_id,
