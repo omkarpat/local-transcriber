@@ -1,6 +1,6 @@
 import AVFoundation
 
-enum MicrophonePermission {
+nonisolated enum MicrophonePermission {
     case undetermined
     case denied
     case granted
