@@ -9,7 +9,7 @@ import Synchronization
 /// If the consumer falls more than `capacity` samples behind, the producer
 /// overwrites the oldest samples and increments `overflowSamples`. This
 /// prioritizes keeping recent audio over retaining stale audio.
-final class CircularAudioBuffer: @unchecked Sendable {
+nonisolated final class CircularAudioBuffer: @unchecked Sendable {
     let capacity: Int
     private let mask: Int
     private let storage: UnsafeMutableBufferPointer<Float>

@@ -101,28 +101,42 @@ nonisolated final class PunctuationClient: @unchecked Sendable {
                     // seen in the wild.
                     var currentEvent = "message"
                     var dataBuffer = ""
+                    let tag = utteranceID.uuidString.prefix(8)
+                    var lineIdx = 0
 
-                    func flushBufferedEvent() -> Bool {
+                    func flushBufferedEvent(reason: String) -> Bool {
                         defer {
                             currentEvent = "message"
                             dataBuffer = ""
                         }
-                        guard !dataBuffer.isEmpty else { return false }
-                        if currentEvent == "stage",
-                           let event = Self.decodeStage(dataBuffer) {
-                            continuation.yield(event)
-                            return event.isFinal
+                        guard !dataBuffer.isEmpty else {
+                            log.info("sse[\(tag, privacy: .public)] flush(\(reason, privacy: .public)) empty-buffer")
+                            return false
+                        }
+                        if currentEvent == "stage" {
+                            if let event = Self.decodeStage(dataBuffer) {
+                                log.info("sse[\(tag, privacy: .public)] yield stage=\(event.stage, privacy: .public) final=\(event.isFinal, privacy: .public)")
+                                continuation.yield(event)
+                                return event.isFinal
+                            } else {
+                                log.error("sse[\(tag, privacy: .public)] decode FAIL data=\(dataBuffer, privacy: .public)")
+                            }
                         } else if currentEvent == "error" {
-                            log.error("server stream error: \(dataBuffer, privacy: .public)")
+                            log.error("sse[\(tag, privacy: .public)] server error event: \(dataBuffer, privacy: .public)")
+                        } else {
+                            log.error("sse[\(tag, privacy: .public)] unknown event type=\(currentEvent, privacy: .public) data=\(dataBuffer, privacy: .public)")
                         }
                         return false
                     }
 
                     for try await line in bytes.lines {
                         if Task.isCancelled { break }
+                        log.info("sse[\(tag, privacy: .public)] line[\(lineIdx, privacy: .public)] len=\(line.count, privacy: .public) \(line, privacy: .public)")
+                        lineIdx += 1
 
                         if line.isEmpty {
-                            if flushBufferedEvent() {
+                            if flushBufferedEvent(reason: "blank") {
+                                log.info("sse[\(tag, privacy: .public)] final — finishing")
                                 continuation.finish()
                                 return
                             }
@@ -139,16 +153,34 @@ nonisolated final class PunctuationClient: @unchecked Sendable {
                             var value = String(line[line.index(after: colon)...])
                             if value.hasPrefix(" ") { value.removeFirst() }
                             switch field {
-                            case "event": currentEvent = value
-                            case "data":  dataBuffer += value
-                            default:      break   // id:, retry:, etc.
+                            case "event":
+                                // `URLSession.AsyncBytes.lines` swallows
+                                // blank lines between SSE events on iOS
+                                // (observed: 4 lines through for a 2-event
+                                // stream, not 6). So a new `event:` arriving
+                                // while a previous event's data is still
+                                // buffered is our only signal that the
+                                // prior event ended. Flush it now.
+                                if !dataBuffer.isEmpty {
+                                    if flushBufferedEvent(reason: "new-event") {
+                                        log.info("sse[\(tag, privacy: .public)] final — finishing")
+                                        continuation.finish()
+                                        return
+                                    }
+                                }
+                                currentEvent = value
+                            case "data":
+                                dataBuffer += value
+                            default:
+                                break   // id:, retry:, etc.
                             }
                         }
                     }
 
+                    log.info("sse[\(tag, privacy: .public)] for-await ended after \(lineIdx, privacy: .public) lines")
                     // Connection closed. Dispatch any pending event the
                     // server emitted without a trailing blank line.
-                    _ = flushBufferedEvent()
+                    _ = flushBufferedEvent(reason: "eof")
                 } catch {
                     log.error("stream read failed: \(String(describing: error), privacy: .public)")
                 }

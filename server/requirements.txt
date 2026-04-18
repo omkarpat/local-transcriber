@@ -4,3 +4,15 @@ onnxruntime==1.19.2
 tokenizers==0.20.0
 pydantic==2.9.2
 numpy==1.26.4
+# Stage 3 ITN: NeMo's WFST-based inverse normalizer. Pinned pynini
+# version below its nemo_text_processing==1.1.0 strict pin because the
+# pinned 2.1.6.post1 fails to build against openfst 1.8.4 (upstream API
+# rename StringJoin → StrJoin). 2.1.7 builds cleanly and runs fine with
+# nemo_text_processing. Install with `pip install -r requirements.txt
+# --no-deps nemo_text_processing` or see Dockerfile for the full recipe.
+pynini==2.1.7
+nemo_text_processing==1.1.0
+# Digit-to-word pre-pass before ITN so ASR-emitted digits ("10 dollars")
+# get normalized to currency symbols. Without this, NeMo ITN's grammar
+# only fires on word-form input and digit-form passes through unchanged.
+num2words==0.5.13

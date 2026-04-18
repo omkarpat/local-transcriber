@@ -13,7 +13,7 @@ enum VADEvent: Sendable {
     case error(String)
 }
 
-final class VADProcessor: @unchecked Sendable {
+nonisolated final class VADProcessor: @unchecked Sendable {
     let events: AsyncStream<VADEvent>
 
     private let ringBuffer: CircularAudioBuffer
@@ -225,7 +225,7 @@ final class VADProcessor: @unchecked Sendable {
 
 /// Tiny ring buffer holding the last N samples of pre-roll audio.
 /// Used by VADProcessor only; not thread-safe.
-private struct PreRoll {
+nonisolated private struct PreRoll {
     let capacity: Int
     private var storage: [Float]
     private var writeIndex = 0
