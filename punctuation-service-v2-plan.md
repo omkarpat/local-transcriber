@@ -621,6 +621,37 @@ Document these as known limitations. Don't build correction logic until you have
 
 If freeway-class errors become a top user complaint after launch, the right move is to push the fix to the ASR layer (Moonshine biasing) rather than adding a Stage 4 correction pass to V2. The post-processing pipeline is the wrong place to solve recognition problems.
 
+## Known Follow-ups
+
+Logged here during implementation; each is in-scope for V2 but not
+blocking for the current work item.
+
+- **Duplicate same-utterance dispatches on the client.** When a first-try
+  `consumeRefinementStream` fails mid-flight and the same `utteranceID`
+  then gets picked up by the retry drain, actor reentrancy can briefly
+  run two concurrent streams for the same utterance. Logs show 2–3 `sse[UUID]`
+  sequences for a single utterance. Not user-visible (UI upserts by
+  `segmentID`) but doubles server CPU for that utterance and can tip a
+  request past the 4 s client timeout under contention. Fix: track
+  in-flight `utteranceID`s in `TranscriptionPipeline` and short-circuit
+  duplicate `consumeRefinementStream` calls in both
+  `dispatchFirstTryPunctuation` and `drainAsManyAsPossible`.
+
+- **Server-side admission control.** The plan already calls for an
+  asyncio semaphore (~4–8 in-flight) with 429/503 on saturation. Not
+  wired up yet — add before any rollout beyond local dev. Required to
+  bound tail latency under burst load and to reject duplicate dispatches
+  cleanly if the client-side fix above misses a case.
+
+- **Drain-loop wake-on-recovery.** `drainLoop` currently sleeps the full
+  backoff (up to 60 s) even when another utterance has just confirmed
+  the server is reachable. `handleRefinementSuccess` intentionally does
+  not cancel the drain (cancelling the in-flight retry stream causes
+  starvation). A wake signal — e.g. a `CheckedContinuation` the sleep
+  races against — would let a success collapse the backoff to ~0 without
+  touching the active stream. Bounded impact today (worst case 60 s),
+  so only do this if the latency shows up in practice.
+
 ## Out of Scope (Explicit)
 
 These are *not* in V2 — punt to V3 conversation:

@@ -23,9 +23,9 @@ Runtime contract — V2 streaming (see `punctuation-service-v2-plan.md`):
     }
     Response: text/event-stream with one or more `event: stage` frames.
     Each frame carries {utterance_id, segment_id, stage, text, final}.
-    Stages emitted today: `punct_case` (XLM-R + regex casing) and `itn`
-    (NeMo WFST normalization). Stage 1 `commands` will land as an
-    additional event as it ships.
+    Stages emitted today, in order: `commands` (ASR punct strip +
+    spoken-command substitution), `punct_case` (XLM-R + regex casing),
+    `itn` (NeMo WFST normalization).
 
 Model is loaded once at startup in the FastAPI lifespan hook so the first
 request doesn't eat the 1-2 s graph init cost. `/healthz` returns 503
@@ -53,6 +53,8 @@ from nemo_text_processing.inverse_text_normalization.inverse_normalize import (
 from num2words import num2words
 from pydantic import BaseModel
 from tokenizers import Tokenizer
+
+from commands import apply_spoken_commands
 
 # ---------- Config (env vars) ------------------------------------------------
 
@@ -317,9 +319,15 @@ async def punctuate_stream(
 ):
     """Streaming refinement endpoint. Emits one `event: stage` frame per
     pipeline stage as each completes; the final event carries `final:
-    true`. Today's stages are `punct_case` (XLM-R punctuation + regex
-    casing) and `itn` (NeMo WFST-based inverse text normalization). When
-    Stage 1 (spoken commands) lands it'll emit before these.
+    true`. Stages in order:
+
+    - `commands` (Stage 1) — strip ASR-supplied punctuation then
+      substitute spoken punctuation commands ("comma" → ",", etc.).
+      Pure function of the input text; see `commands.py`.
+    - `punct_case` (Stage 2) — XLM-R token-classification punctuation +
+      regex sentence casing.
+    - `itn` (Stage 3) — NeMo WFST-based inverse text normalization
+      ("ten dollars" → "$10").
 
     Clients should key on `stage` (not event order) and treat each event
     as the *current* text for the given segment — each stage overwrites
@@ -340,11 +348,24 @@ async def punctuate_stream(
 
     async def gen():
         try:
+            # Stage 1: spoken punctuation commands + ASR punct strip.
+            # Pure string ops, sub-millisecond — `to_thread` is overkill
+            # but keeps the yield-between-stages pattern uniform.
+            stage1_text = await asyncio.to_thread(apply_spoken_commands, req.text)
+            log.info("stream utter=%s stage=commands text=%r", utter_tag, stage1_text)
+            yield _sse("stage", {
+                "utterance_id": req.utterance_id,
+                "segment_id": req.segment_id,
+                "stage": "commands",
+                "text": stage1_text,
+                "final": False,
+            })
+
             # Stage 2: punct + case. Blocking ONNX call → asyncio.to_thread
             # so the event loop can flush this stage's bytes before Stage 3
             # starts. Without offloading, the whole response would arrive
             # together at EOF, defeating the streaming.
-            refined = await asyncio.to_thread(_run_v1_pipeline, req.text)
+            refined = await asyncio.to_thread(_run_v1_pipeline, stage1_text)
             log.info("stream utter=%s stage=punct_case text=%r", utter_tag, refined)
             yield _sse("stage", {
                 "utterance_id": req.utterance_id,
