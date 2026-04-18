@@ -48,6 +48,8 @@ Response
 
 A single request synchronously running all three stages is ~100ms p50. That's fine, but extending to V3 (LLM fallback, 500ms–2s) would be painful to retrofit onto a single-response contract. Ship V2 as SSE from day one — the per-stage events cost almost nothing on localhost, and V3 adds one more event type instead of a breaking contract change.
 
+SSE is the right edge protocol for this problem because the interaction is request-scoped, one-way, and stateless. Do not switch to WebSockets unless the product adds true bidirectional or sessionful behavior. Also note: SSE does **not** change the main scaling bottleneck here — model execution remains the thing that saturates first.
+
 ### Endpoint
 
 Additive — V1 `/punctuate` stays for clients that haven't adopted streaming. V2 introduces `/punctuate/stream`.
@@ -82,7 +84,10 @@ The last event of the stream has `"final": true`. On pipeline failure the server
 
 - FastAPI `StreamingResponse` with media_type `text/event-stream`. The generator must `await asyncio.to_thread(...)` for the blocking ONNX calls so bytes flush between stages; otherwise the loop stalls and the whole stream arrives at once, defeating the point.
 - Response headers must include `Cache-Control: no-cache` and `X-Accel-Buffering: no` to defeat proxy/ALB buffering.
-- Per-task concurrency stays bounded by the existing asyncio semaphore (~4–8 inflight). Streaming doesn't change the ORT "one inference at a time per session" constraint.
+- Add a process-wide asyncio semaphore (~4-8 inflight) before rollout. On saturation, reject quickly with `429`/`503` rather than queueing unbounded work inside the FastAPI process.
+- Check for disconnect before starting each stage. Once work has been dispatched into `asyncio.to_thread(...)`, the underlying ONNX inference is not cancellable in practice, so keep stages small and instrument abandoned work.
+- If future stages can leave >30s gaps between bytes, emit SSE heartbeat comments (or raise ALB idle timeout) so the load balancer does not kill an otherwise-healthy stream.
+- Track application-level stream failures explicitly. An SSE `error` event still rides on HTTP 200, so ALB success-rate dashboards alone are insufficient.
 
 ### Client implementation pointers (iOS)
 
@@ -531,14 +536,11 @@ Plan for **~25 QPS per `c7g.xlarge` task** as the realistic number with the reco
 
 Spread across 2-3 AZs minimum. Set HPA target on `RequestCountPerTarget` at 60% of measured per-task peak (so ~15 RPS per target), not on CPU utilization — CPU lags request queueing under burst load.
 
+Deployment guidance: keep Fargate for early production and moderate traffic. If sustained load grows into the several-hundred-RPS range, keep the SSE contract at the edge and move the workers first — ECS on EC2 and/or a batched inference tier are better scaling levers than replacing SSE.
+
 ### Cost
 
-At 25 QPS per task and `c7g.xlarge` at $0.12/hr on-demand:
-- ~$0.55 per million requests on-demand
-- ~$0.20 per million on spot
-- Plus ALB at ~$0.008 per million
-
-Roughly 2x the V1 estimate because the per-task QPS is lower than the V1 doc claimed. Still very cheap in absolute terms.
+The first real cost wall is usually idle baseline (always-on tasks + ALB), not marginal request cost. Recompute current AWS pricing at rollout time; as a rule of thumb, once the service needs dozens of hot tasks, move to EC2 and/or batching before considering any API-protocol redesign.
 
 ## Gotchas
 
@@ -552,8 +554,11 @@ Roughly 2x the V1 estimate because the per-task QPS is lower than the V1 doc cla
 - **NeMo `.nemo` → ONNX export sometimes loses metadata.** Verify label mappings round-trip correctly before deploying. Ship a `labels.json` alongside the model and load it explicitly.
 - **Test on real Moonshine output, not synthetic.** Moonshine drops some fillers and produces lowercase output without punctuation — make sure your eval set reflects that distribution.
 - **One inference at a time per ORT session.** Don't assume `intra_op_num_threads=4` means "4 parallel requests" — it means one request gets 4 threads of intra-op parallelism. See Concurrency Model above.
+- **Burst failure mode is queueing, not socket count.** Without admission control, p99 blows up because requests pile up behind shared inference, then clients timeout and retry.
 - **Hard request timeout.** Set FastAPI/uvicorn request timeout to ~400ms. Pathological inputs (e.g. adversarial long inputs that slip past the size check) can otherwise tail-blow p99.
 - **Pre-warm new tasks before adding to ALB.** First 10-50 requests on a fresh task have cold ORT memory and worse latency. Either route synthetic warm-up traffic or accept temporary latency degradation after scale-out.
+- **Client timeout can still burn server CPU.** Once a stage has entered `asyncio.to_thread(...)`, the work may finish even if the client has already given up. Track disconnects and abandoned work explicitly.
+- **SSE errors are not HTTP errors.** Emit stream-failure and fallback counters so incidents are visible in dashboards even when the transport returns 200.
 - **Track p50/p95/p99/p999 separately.** Averages hide the tail. Use CloudWatch histograms or Prometheus.
 
 ## V3 Hook: LLM Fallback Pattern

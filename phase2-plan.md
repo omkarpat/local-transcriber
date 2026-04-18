@@ -22,13 +22,13 @@
 **Subtasks** (client-side; the server track is independent):
 
 - **1.1** Ship Commit 1 (**DONE** — this session): rename `.punctuated` → `.refined`, introduce `TranscriptRefinement` carrying both `utteranceID` (provenance) and `segmentID` (UI upsert key, equal to `utteranceID` until the server starts splitting), merge the user-facing view into a single flowing paragraph. Retry path still single-shot against `/punctuate`; zero behaviour change.
-- **1.2** Ship Commit 2 (server): new `/punctuate/stream` endpoint emitting SSE events per stage (`commands` → `punct_case` → `itn`). Stateless. `segment_id` is deterministic `uuidv5(utteranceID, index)` so retries reproduce the same IDs and update in place. See v2 plan for the event shape.
+- **1.2** Ship Commit 2 (server): new `/punctuate/stream` endpoint emitting SSE events per stage (`commands` → `punct_case` → `itn`). Stateless. `segment_id` is deterministic `uuidv5(utteranceID, index)` so retries reproduce the same IDs and update in place. Add explicit in-flight backpressure, overload responses, and stream-failure metrics as part of this commit. See v2 plan for the event shape.
 - **1.3** Ship Commit 3 (client): `PunctuationClient.punctuateStream(...)` returning `AsyncStream<PunctuationStageEvent>` via `URLSession.bytes(for:)`; teach `TranscriptionPipeline.dispatchFirstTryPunctuation` to consume the stream and yield one `.refined` update per stage. Each stage's text overwrites the prior stage for that `segmentID` — the UI sees the paragraph progressively improve.
 - **1.4** Retry hardening: `PendingPunctuation` grows a `segmentIDAtDispatch` field so retries replay with the same incoming segment id. Deterministic uuidv5 on the server makes this largely moot today (single-segment), but paying the cost now keeps the contract honest when splitting lands.
-- **1.5** Telemetry: per-stage latency logging (stage wall time, stream lifetime, partial vs. full completion). Keep client-side; no PII. Guard behind the existing debug view toggle.
-- **1.6** Smoke test end-to-end on simulator + physical device: verify mid-stream failures fall back cleanly to raw text, verify retries during server-down scenarios still produce the same rendered output.
+- **1.5** Telemetry: per-stage latency logging (stage wall time, stream lifetime, partial vs. full completion) plus server-side counters for in-flight requests, overload rejects, stream failures, disconnects, and fallback rate. Keep payloads PII-free; guard client-side debug output behind the existing debug view toggle.
+- **1.6** Smoke test end-to-end on simulator + physical device: verify mid-stream failures fall back cleanly to raw text, verify retries during server-down scenarios still produce the same rendered output, and verify burst traffic is shed explicitly instead of timing out silently.
 
-**Acceptance Criteria**: User sees text progressively improve through commands → punct+case → ITN stages in real time. Stream failures degrade silently to raw local transcript. Retry queue survives server blips without producing duplicate or orphan segments in the UI.
+**Acceptance Criteria**: User sees text progressively improve through commands → punct+case → ITN stages in real time. Stream failures degrade silently to raw local transcript. Retry queue survives server blips without producing duplicate or orphan segments in the UI. Under burst load, the server sheds excess work explicitly rather than letting p99 grow without bound.
 
 ---
 

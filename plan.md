@@ -69,7 +69,8 @@ The app uses a local-first pipeline: streaming ASR on-device for fast word recog
                                           (X-API-Key auth)
                                                       │
 ┌─────────────────────────────────────────────────────▼──────────┐
-│  Punctuation Refinement Service (ECS Fargate, stateless)       │
+│  Punctuation Refinement Service (stateless; Fargate first,     │
+│  EC2/batched workers later if scale demands it)                │
 │                                                                 │
 │  FastAPI + ONNX Runtime (CPU-only, INT8 quantized)             │
 │                                                                 │
@@ -174,7 +175,7 @@ The service is **optional**. When offline or on server failure the app shows the
 
 - **Runtime**: FastAPI + ONNX Runtime (CPU, INT8 quantized XLM-R base)
 - **Endpoint**: `POST /punctuate` — single request/response with punctuated + regex-cased text
-- **Deployment**: ECS Fargate (`c7g.xlarge`), ALB, single-AZ for now
+- **Deployment**: ECS Fargate initially (4 vCPU / 8 GB task) behind ALB, single-AZ for now. Keep the HTTP+SSE contract stable if/when the workers move to ECS on EC2 or a batched inference tier at higher sustained load.
 - **Auth**: shared `X-API-Key` header; no per-user auth yet
 - **Model**: `oliverguhr/fullstop-punctuation-multilingual-base`, INT8 ONNX
 
@@ -193,6 +194,8 @@ And a new endpoint:
 - **`POST /punctuate/stream`** — returns `text/event-stream` with one `event: stage` per pipeline stage. Client renders progressively-improved text as each stage lands.
 
 See `punctuation-service-v2-plan.md` for the V2 plan including the wire contract, two-ID model (utteranceID + segmentID), deterministic uuidv5 segment IDs for retry idempotency, and stateless-server rationale.
+
+Architectural posture: keep SSE + FastAPI as the edge contract. If scale pressure shows up, change the compute substrate first (EC2 workers, batching), not the client-visible API.
 
 ### Client Integration (iOS)
 
@@ -248,7 +251,7 @@ V1 and V2 punctuation services handle *formatting* problems. Neither can fix ASR
 - **Contract**: extend the V2 SSE stream with an optional `event: stage` carrying `stage: "llm_correction"`. The client already renders progressively, so adding one more late-arriving event is a no-op on the UI.
 - **Budget**: 500ms–2s p99 is acceptable because this stage runs *after* the deterministic pipeline has already shown text. Network tail doesn't stall the UI.
 
-Earlier versions of this plan specified WebSocket + API Gateway + Bedrock + Cognito as the main cloud path. That architecture is shelved — the stateless HTTP+SSE shape we're using for V1/V2 is simpler, faster to iterate on, and extends cleanly into Phase 4's LLM fallback. Cognito auth, per-user sessions, and WebSocket connection management become relevant only if we add features that actually need them (e.g., bidirectional streaming, live collaboration).
+Earlier versions of this plan specified WebSocket + API Gateway + Bedrock + Cognito as the main cloud path. That architecture is shelved — the stateless HTTP+SSE shape we're using for V1/V2 is simpler, faster to iterate on, and extends cleanly into Phase 4's LLM fallback. If scale becomes the problem, the first move is to change the worker substrate (ECS on EC2, batching), not to replace SSE. Cognito auth, per-user sessions, and WebSocket connection management become relevant only if we add features that actually need them (e.g., bidirectional streaming, live collaboration).
 
 ---
 
@@ -459,7 +462,7 @@ See `phase2-plan.md` for the detailed task breakdown.
 
 - [ ] Task 1: Adopt V2 streaming refinement
     - Commit 1 (**DONE**): rename `.punctuated` → `.refined`; introduce `TranscriptRefinement` with `utteranceID` + `segmentID`; merge user-facing view into a single flowing paragraph
-    - Commit 2: server `POST /punctuate/stream` with SSE + deterministic uuidv5 segment IDs (tracked in `punctuation-service-v2-plan.md`)
+    - Commit 2: server `POST /punctuate/stream` with SSE + deterministic uuidv5 segment IDs + explicit in-flight backpressure / overload handling (tracked in `punctuation-service-v2-plan.md`)
     - Commit 3: client `PunctuationClient.punctuateStream()` via `URLSession.bytes(for:)`, wire into pipeline
 - [ ] Task 2: Progressive paragraph rendering (auto-scroll, stage transitions, paragraph breaks when server splits)
 - [ ] Task 3: SwiftData persistence for sessions
@@ -481,7 +484,7 @@ See `punctuation-service-v2-plan.md` for the service-side plan.
 - [ ] Swap XLM-R → NeMo joint DistilBERT for punct+case; A/B on labeled eval set; gate behind flag
 - [ ] Add Stage 1 spoken commands; build labeled eval set for precision/recall tuning
 - [ ] Wire deterministic `silence_before_ms` from client VAD timeline to enable cross-utterance paragraph splits
-- [ ] Observability: per-stage latency histograms, p50/p95/p99/p999 tracked separately
+- [ ] Observability: per-stage latency histograms, p50/p95/p99/p999 tracked separately, plus in-flight request count, overload rejects, disconnects, and fallback rate
 
 **Exit criteria**: All three stages in production behind flags with documented quality wins on labeled eval. p99 < 250ms for 30–60 token inputs. No regression on V1 punctuation F1.
 
@@ -558,7 +561,7 @@ See `punctuation-service-v2-plan.md` for the service-side plan.
 
 | Service | Purpose | Phase |
 |---|---|---|
-| ECS Fargate (`c7g.xlarge`) | Run the FastAPI refinement service (CPU-only ONNX inference) | 1 |
+| ECS Fargate (initial) / ECS on EC2 (scale-up) | Run the FastAPI refinement service (CPU-only ONNX inference) | 1 |
 | Application Load Balancer | Terminate HTTPS, auth via `X-API-Key`, route to ECS tasks | 1 |
 | ECR | Container image registry for the service | 1 |
 | CloudWatch | Task + latency histograms, alarm on error rate | 1 |

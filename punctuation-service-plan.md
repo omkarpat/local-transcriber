@@ -24,7 +24,7 @@ If any of the "out" items become product requirements later, escalate the archit
         │ HTTPS POST {text}
         ▼
 [ALB] → [ECS Service: FastAPI + ONNX Runtime] → response
-              (auto-scaled on RequestCountPerTarget)
+              (start on Fargate; move to EC2/batching if scale requires)
 ```
 
 Stateless, single-endpoint, horizontally scalable. No Redis, no queue, no database.
@@ -147,50 +147,52 @@ XLM-R has a 512-token limit; keep chunks ≤256 with overlap so boundary tokens 
 
 Build this from day one — production utterances will sometimes be long.
 
-## Deployment (ECS)
+## Deployment Strategy (ECS)
 
 | Component | Choice |
 |-----------|--------|
-| Compute | ECS on EC2, `c7g.xlarge` (4 vCPU Graviton3) |
+| Compute | ECS Fargate initially (4 vCPU / 8 GB ARM task); keep the same container ready to move to ECS on EC2 (`c7g.xlarge`+) once sustained traffic or cost justifies it |
 | Container | Distroless or slim Python base, ~400 MB total |
 | Load balancer | ALB, HTTP/2, TLS termination |
 | Auto-scale | Target tracking on `RequestCountPerTarget` @ 60% of measured peak |
-| Min capacity | 2 tasks per AZ across 2-3 AZs |
+| Min capacity | 2 tasks for early production; 2 tasks per AZ once the service is multi-AZ |
 | Health check | `/healthz` returning 200 once ORT session is loaded |
 
 **Cold start:** ~10-20s (container pull + model load + ORT init). Scale out *before* needing capacity — target 60% utilization, not 85%.
 
 **Spot for cost savings:** mix on-demand (baseline) + spot (burst) via capacity providers. ~60-70% cost cut on spot portion.
 
-**Start on Fargate** if ops simplicity matters more than cost; move to EC2 once sustained traffic justifies it (~50+ QPS).
+**Recommendation:** keep the HTTP/SSE contract stable and scale by changing compute before changing API shape. Fargate is the right early-production choice for moderate traffic and low ops overhead; move to ECS on EC2 or a batched inference tier once the service needs dozens of always-on tasks or several hundred sustained RPS.
 
 ## Performance Expectations
 
-Per-instance, INT8 quantized XLM-R base, 30-60 token utterances:
+Use conservative planning numbers for 30-60 token utterances until load-tested on target hardware:
 
-| Instance | QPS | p50 latency | p99 latency |
-|----------|-----|-------------|-------------|
-| `c7g.large` (2 vCPU) | 40-80 | 50-90 ms | ~150 ms |
-| `c7g.xlarge` (4 vCPU) | 80-150 | 50-90 ms | ~150 ms |
-| `c7g.2xlarge` (8 vCPU) | 150-280 | 50-90 ms | ~150 ms |
+| Task size / host | Sustained RPS | Service time | Notes |
+|------------------|---------------|--------------|-------|
+| 2 vCPU task | ~8-15 | ~90-220 ms | Queueing-sensitive under burst |
+| 4 vCPU task | ~15-25 | ~80-200 ms | Recommended starting point |
+| 8 vCPU task | ~30-50 | ~80-220 ms | Useful only if single-task density matters |
 
-Scales linearly with vCPUs (within a process) and linearly with task count (across the service). 10K sustained QPS ≈ 67 `c7g.xlarge` tasks.
+Model execution dominates request cost; SSE framing does not materially change these numbers. Re-benchmark after every model swap or thread-count change.
 
-**Cost at scale:** ~$0.25 per million requests on-demand, ~$0.10 per million on spot (compute + ALB).
+**Cost framing:** the first real cost wall is the idle baseline (always-on tasks + ALB), not marginal request cost. Recompute current AWS pricing when choosing between Fargate and EC2; if the service grows to dozens of hot tasks, EC2 or batching will usually be the better lever than changing the public API.
 
 ## Gotchas to Watch
 
 - **Tokenizer must be the Rust `tokenizers` library**, not Python `transformers` slow tokenizer. Verify with `tokenizer.is_fast` if you load via `AutoTokenizer`. At sub-100ms latencies the slow tokenizer becomes 20-40% of request time.
 - **Reject inputs >2000 chars** at the edge. Prevents pathological requests from blocking workers.
+- **Add explicit in-flight backpressure.** Use a process-wide semaphore and fail fast with `429`/`503` when full. Do not let FastAPI queue unbounded inference work internally.
 - **One uvicorn worker per task.** Set `--workers 1`. Threading happens inside ORT.
-- **Pin `OMP_NUM_THREADS` and `MKL_NUM_THREADS`** to match `intra_op_num_threads` to avoid thread oversubscription:
+- **Pin `OMP_NUM_THREADS` and `MKL_NUM_THREADS`** to match `intra_op_num_threads` to avoid thread oversubscription. Start tuning at `intra_op_num_threads=2` on 4 vCPU tasks; more threads are not automatically higher throughput:
   ```bash
-  ENV OMP_NUM_THREADS=4
-  ENV MKL_NUM_THREADS=4
+  ENV OMP_NUM_THREADS=2
+  ENV MKL_NUM_THREADS=2
   ```
 - **Model load on import, not on first request.** Otherwise the first request after scale-out gets a 5-10s spike.
 - **Health check should fail until model is loaded.** Otherwise ALB sends traffic to a cold task.
-- **Log p50/p95/p99 latency and tokens-per-request** from day one. You can't tune what you can't see.
+- **Client disconnects do not automatically cancel ONNX work.** If inference has already been dispatched to a background thread, the task can keep burning CPU after the client has timed out. Instrument disconnects, timeouts, and fallback rate.
+- **Log p50/p95/p99 latency, tokens-per-request, in-flight requests, and overload rejects** from day one. You can't tune what you can't see.
 
 ## What's Explicitly Not Here
 
@@ -208,7 +210,7 @@ If product asks for any of these, this service does not handle them — they bel
 ```dockerfile
 FROM python:3.12-slim
 
-ENV OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 \
+ENV OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 \
     PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 
 WORKDIR /app
