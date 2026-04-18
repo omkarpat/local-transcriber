@@ -23,8 +23,9 @@ Runtime contract — V2 streaming (see `punctuation-service-v2-plan.md`):
     }
     Response: text/event-stream with one or more `event: stage` frames.
     Each frame carries {utterance_id, segment_id, stage, text, final}.
-    Today only `stage: "punct_case"` is emitted; Stages 1 (commands) and
-    3 (ITN) will land as separate events as they ship.
+    Stages emitted today: `punct_case` (XLM-R + regex casing) and `itn`
+    (NeMo WFST normalization). Stage 1 `commands` will land as an
+    additional event as it ships.
 
 Model is loaded once at startup in the FastAPI lifespan hook so the first
 request doesn't eat the 1-2 s graph init cost. `/healthz` returns 503
@@ -46,6 +47,9 @@ import numpy as np
 import onnxruntime as ort
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
+from nemo_text_processing.inverse_text_normalization.inverse_normalize import (
+    InverseNormalizer,
+)
 from pydantic import BaseModel
 from tokenizers import Tokenizer
 
@@ -58,6 +62,12 @@ CONFIG_PATH = MODEL_DIR / "config.json"
 
 API_KEY = os.environ.get("PUNCTUATION_API_KEY", "dev-key-change-me")
 NUM_THREADS = int(os.environ.get("NUM_THREADS", os.cpu_count() or 2))
+
+# ITN (Stage 3 of the V2 pipeline) uses NeMo Text Processing's WFST-based
+# InverseNormalizer. First construction compiles the FST graphs (~10-30 s
+# in the worst case, ~1-2 s with cache); we do this once at startup.
+ITN_CACHE_DIR = Path(os.environ.get("ITN_CACHE_DIR", Path(__file__).parent / "itn_cache"))
+ITN_LANG = os.environ.get("ITN_LANG", "en")
 
 # Reject inputs over this many chars at the edge — keeps pathological
 # requests from blocking a worker. ~1500 chars ≈ 300 words ≈ well past
@@ -89,6 +99,7 @@ _id_to_label: dict[int, str] = {}   # {0: "0", 1: ".", 2: ",", ...}
 _bos_id: int = 0
 _eos_id: int = 0
 _pad_id: int = 0
+_itn: Optional[InverseNormalizer] = None
 _model_ready: bool = False
 
 
@@ -138,11 +149,30 @@ def _load_model() -> None:
     log.info("model ready")
 
 
+def _load_itn() -> None:
+    """Construct the NeMo ITN normalizer. First construction compiles WFST
+    grammars; with `ITN_CACHE_DIR` set the compiled grammars persist
+    across restarts so this drops from ~10-30 s to ~1-2 s. We also run a
+    warm-up call so the first real request doesn't eat the lazy init
+    cost hidden inside the first `inverse_normalize` invocation."""
+    global _itn
+
+    ITN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    log.info("loading ITN (lang=%s, cache=%s)", ITN_LANG, ITN_CACHE_DIR)
+    _itn = InverseNormalizer(lang=ITN_LANG, cache_dir=str(ITN_CACHE_DIR))
+
+    # Warm-up: exercises the full path once so first real request has a
+    # hot cache for common WFST branches.
+    _ = _itn.inverse_normalize("one two three", verbose=False)
+    log.info("ITN ready")
+
+
 # ---------- FastAPI app ------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _load_model()
+    _load_itn()
     yield
 
 
@@ -206,6 +236,37 @@ def _run_v1_pipeline(text: str) -> str:
     return _apply_casing(joined)
 
 
+# Two WFST artifacts worth fixing in NeMo ITN's output:
+# 1. Spaces before trailing punctuation — "2027 .", "100 %", "word ,".
+#    Reads as broken. Conservative regex: does not touch internal dots
+#    in abbreviations like "U.S." or "p.m." because those have no space.
+# 2. Doubled periods when an abbreviation ("p.m.", "a.m.") lands at end
+#    of a sentence that already had a terminal period from Stage 2:
+#    "at 03:00 p.m..". Safe against ellipsis because our Stage 2 label
+#    set (`. , ? - :`) can't emit "..." in the first place.
+_ITN_POST_CLEANUP_SPACE = re.compile(r" +([.,?!;:%])")
+_ITN_POST_CLEANUP_DOUBLE = re.compile(r"\.\.(?=\s|$)")
+
+
+def _stage_itn(text: str) -> str:
+    """Stage 3: inverse text normalization. Converts spoken-form numbers
+    and entities ("twenty twenty seven", "ten dollars") to written form
+    ("2027", "$10"). Operates on already-punctuated/cased text from
+    Stage 2. Graceful fallback — if the WFST raises on a pathological
+    input, return the text unchanged rather than failing the whole
+    stream; Stage 2's output is still useful."""
+    if not text or _itn is None:
+        return text
+    try:
+        normalized = _itn.inverse_normalize(text, verbose=False)
+    except Exception:
+        log.exception("ITN failed on %r; passing through unchanged", text)
+        return text
+    normalized = _ITN_POST_CLEANUP_SPACE.sub(r"\1", normalized)
+    normalized = _ITN_POST_CLEANUP_DOUBLE.sub(".", normalized)
+    return normalized
+
+
 def _sse(event: str, payload: dict) -> bytes:
     """One SSE frame: `event:` line, `data:` line with JSON payload, blank
     terminator. Bytes (not str) so the streaming generator can yield
@@ -218,10 +279,15 @@ async def punctuate_stream(
     req: PunctuateStreamRequest,
     _: None = Depends(_require_api_key),
 ):
-    """Streaming refinement endpoint. Today emits a single `stage:
-    "punct_case"` event wrapping the V1 output with `final: true`. As
-    Stage 1 (commands) and Stage 3 (ITN) land, they'll add events before
-    and after this one — clients should key on `stage` not event order.
+    """Streaming refinement endpoint. Emits one `event: stage` frame per
+    pipeline stage as each completes; the final event carries `final:
+    true`. Today's stages are `punct_case` (XLM-R punctuation + regex
+    casing) and `itn` (NeMo WFST-based inverse text normalization). When
+    Stage 1 (spoken commands) lands it'll emit before these.
+
+    Clients should key on `stage` (not event order) and treat each event
+    as the *current* text for the given segment — each stage overwrites
+    the prior stage's output for that segmentID.
 
     Stateless: `segment_id` is echoed back verbatim. No new segment ids
     are minted yet because splitting hasn't shipped; when it does, new
@@ -233,16 +299,28 @@ async def punctuate_stream(
 
     async def gen():
         try:
-            # ONNX `session.run` is blocking; offload so the event loop
-            # can flush bytes between stages when there's more than one
-            # stage to emit (today still a single stage, but the pattern
-            # needs to be in place for Stages 1 and 3).
+            # Stage 2: punct + case. Blocking ONNX call → asyncio.to_thread
+            # so the event loop can flush this stage's bytes before Stage 3
+            # starts. Without offloading, the whole response would arrive
+            # together at EOF, defeating the streaming.
             refined = await asyncio.to_thread(_run_v1_pipeline, req.text)
             yield _sse("stage", {
                 "utterance_id": req.utterance_id,
                 "segment_id": req.segment_id,
                 "stage": "punct_case",
                 "text": refined,
+                "final": False,
+            })
+
+            # Stage 3: ITN. Pynini's WFST traversal is fast (~1-5 ms for
+            # typical utterances) but still CPU-bound; offload so it doesn't
+            # block the event loop for concurrent streams.
+            normalized = await asyncio.to_thread(_stage_itn, refined)
+            yield _sse("stage", {
+                "utterance_id": req.utterance_id,
+                "segment_id": req.segment_id,
+                "stage": "itn",
+                "text": normalized,
                 "final": True,
             })
         except Exception as e:

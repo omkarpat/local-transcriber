@@ -15,13 +15,33 @@ ENV OMP_NUM_THREADS=4 \
 
 WORKDIR /app
 
+# Stage 3 ITN needs OpenFst (pynini's C++ dep) + a toolchain to build it
+# from source. libgomp1 is onnxruntime's OpenMP runtime. build-essential
+# is only required for the pynini build; it could be dropped in a
+# multi-stage build later if image size becomes a concern.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgomp1 \
+        libfst-dev \
+        libfst-tools \
+        build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+# --no-deps on nemo_text_processing because its strict `pynini==2.1.6.post1`
+# pin fails to build against current openfst; we pin pynini==2.1.7
+# ourselves (requirements.txt covers the rest of the deps).
+RUN pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir --no-deps nemo_text_processing==1.1.0
 
 # Model artifacts first (changes rarely) then app code (changes often) —
 # Docker layer cache friendly.
 COPY model-onnx/ ./model-onnx/
 COPY app.py ./
+
+# Pre-compile ITN WFST grammars so cold-start readiness is fast. Without
+# this the first `/punctuate/stream` request eats ~1-2 s of lazy init.
+RUN mkdir -p itn_cache && \
+    python -c "from nemo_text_processing.inverse_text_normalization.inverse_normalize import InverseNormalizer; InverseNormalizer(lang='en', cache_dir='/app/itn_cache').inverse_normalize('one two three', verbose=False)"
 
 EXPOSE 8000
 

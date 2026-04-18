@@ -1,14 +1,31 @@
 # Punctuation Service
 
-FastAPI + ONNX Runtime wrapper around
-[`oliverguhr/fullstop-punctuation-multilingual-base`](https://huggingface.co/oliverguhr/fullstop-punctuation-multilingual-base)
-(XLM-RoBERTa base, token classification) that the iOS app posts
-finalized transcripts to for punctuation + sentence casing.
+FastAPI + ONNX Runtime wrapper that the iOS app posts finalized
+transcripts to for punctuation + sentence casing + inverse text
+normalization. Two endpoints:
 
-Design doc: `../punctuation-service-plan.md`.
+- `POST /punctuate` — V1, single JSON response. Just punct + case.
+- `POST /punctuate/stream` — V2, Server-Sent Events. Emits a `punct_case`
+  stage then an `itn` stage (inverse text normalization, e.g.
+  "ten dollars" → "$10", "twenty twenty seven" → "2027"). Stage 1
+  spoken-command detection will be added later. Clients render text
+  progressively as each stage event arrives.
+
+Punctuation model:
+[`oliverguhr/fullstop-punctuation-multilingual-base`](https://huggingface.co/oliverguhr/fullstop-punctuation-multilingual-base)
+(XLM-RoBERTa base, token classification, INT8 quantized).
+ITN: NeMo Text Processing (WFST-based, no ML inference).
+
+Design docs: `../punctuation-service-plan.md` (V1),
+`../punctuation-service-v2-plan.md` (V2 — streaming contract,
+segment-id model, stage sequencing).
 Client integration: `../VoxLocal/VoxLocal/Services/PunctuationClient.swift`.
 
 ## Local — native Python
+
+Stage 3 ITN depends on `pynini`, which builds against OpenFst C++
+headers. On macOS: `brew install openfst`. On Debian/Ubuntu:
+`apt-get install libfst-dev`.
 
 One-time model export (downloads ~1 GB from Hugging Face, exports to
 ONNX, quantizes to INT8 — takes 3–5 minutes):
@@ -16,7 +33,16 @@ ONNX, quantizes to INT8 — takes 3–5 minutes):
 ```bash
 cd server
 python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt -r requirements-export.txt
+
+# pynini's current packaging on PyPI (2.1.6.post1) does not compile
+# against openfst >= 1.8.4 (StringJoin → StrJoin upstream rename).
+# 2.1.7 fixes this but nemo_text_processing still pins the old version.
+# Install pynini 2.1.7 first, then install nemo_text_processing with
+# --no-deps to bypass the strict pin.
+CPPFLAGS="-I/opt/homebrew/include" LDFLAGS="-L/opt/homebrew/lib" \
+  pip install pynini==2.1.7
+pip install -r requirements.txt -r requirements-export.txt --no-deps nemo_text_processing
+
 python export_model.py
 ```
 
@@ -32,12 +58,27 @@ PUNCTUATION_API_KEY=dev-key-change-me \
 Smoke-test:
 
 ```bash
+# V1 (non-streaming):
 curl -s http://127.0.0.1:8000/healthz
 curl -s -X POST http://127.0.0.1:8000/punctuate \
   -H 'Content-Type: application/json' \
   -H 'X-API-Key: dev-key-change-me' \
   -d '{"text": "hello world how are you"}'
 # -> {"text": "Hello world how are you?"}
+
+# V2 (SSE streaming, two stages):
+curl -sN -X POST http://127.0.0.1:8000/punctuate/stream \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: text/event-stream' \
+  -H 'X-API-Key: dev-key-change-me' \
+  -d '{"text": "send me ten dollars by twenty twenty seven",
+       "utterance_id": "a1111111-1111-1111-1111-111111111111",
+       "segment_id":   "a1111111-1111-1111-1111-111111111111"}'
+# event: stage
+# data: {..., "stage": "punct_case", "text": "Send me ten dollars by twenty twenty seven.", "final": false}
+#
+# event: stage
+# data: {..., "stage": "itn",        "text": "Send me $10 by 2027.",                        "final": true}
 ```
 
 Then ⌘R in Xcode; the iOS app defaults to `http://127.0.0.1:8000` and
@@ -72,10 +113,14 @@ The Dockerfile expects `model-onnx/` to be present in the build context
 Environment variables:
 
 - `PUNCTUATION_API_KEY` (default `dev-key-change-me`) — required header
-  value on every `POST /punctuate`
-- `MODEL_DIR` (default `./model-onnx`) — where to find artifacts
+  value on every `POST /punctuate` and `POST /punctuate/stream`
+- `MODEL_DIR` (default `./model-onnx`) — where to find punctuation artifacts
 - `MODEL_FILENAME` (default `model.int8.onnx`) — filename under `MODEL_DIR`
 - `NUM_THREADS` (default = CPU count) — ONNX intra-op threads
+- `ITN_CACHE_DIR` (default `./itn_cache`) — where NeMo ITN writes its
+  compiled WFST grammars. Persist this across restarts to avoid the
+  ~1–2 s cold-start grammar compilation cost.
+- `ITN_LANG` (default `en`) — NeMo ITN language code
 
 ## Operational notes (from the service plan)
 
