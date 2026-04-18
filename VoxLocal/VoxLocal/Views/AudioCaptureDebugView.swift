@@ -316,11 +316,11 @@ struct AudioCaptureDebugView: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
-        case .final(let tokenCount, let rtf, let punctuated):
+        case .final(let tokenCount, let rtf, let refined):
             VStack(alignment: .leading, spacing: 2) {
                 Text(row.text.isEmpty ? "(empty)" : row.text)
                     .font(.body)
-                Text("\(format(duration: row.utteranceDuration))  ·  \(String(format: "RTF %.2f", rtf))  ·  \(tokenCount) tok  ·  \(punctuated ? "punctuated" : "raw")")
+                Text("\(format(duration: row.utteranceDuration))  ·  \(String(format: "RTF %.2f", rtf))  ·  \(tokenCount) tok  ·  \(refined ? "refined" : "raw")")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }

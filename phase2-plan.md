@@ -1,93 +1,64 @@
-# Phase 2: Punctuation & Polish — Detailed Task Plan
+# Phase 2: Refinement, Persistence & Polish — Detailed Task Plan
 
-**Goal**: Add punctuation restoration, session persistence, export, and a polished UX.
+**Goal**: Adopt the V2 streaming refinement service, add session persistence, export, and polish the UX.
 **Timeline**: Weeks 5–7 (~60–80 dev hours)
-**Dependencies**: Phase 1 complete (working local ASR pipeline)
-**Exit Criteria**: User gets punctuated, capitalized transcripts. Sessions are saved and exportable. App works in background.
+**Dependencies**: Phase 1 complete — local ASR pipeline working, V1 cloud punctuation service (`/punctuate`) integrated and shipping refined text on `TranscriptUpdate.refined`.
+**Exit Criteria**: User gets progressively-refined transcripts streamed from the V2 service, with sessions saved and exportable, and the app working in the background.
+
+> **Scope correction from original plan**: The earlier version of this doc assumed an on-device punctuation model would be Phase 2 Task 1. That work turned out differently — Phase 1 shipped a stateless cloud service (FastAPI + ONNX + XLM-R quantized) that already returns punctuated + cased text. So Phase 2's punctuation-related work is **not** to integrate a model, it's to **upgrade the existing cloud path to V2 streaming** (ITN, better truecasing, spoken commands) using SSE so the UI can progressively improve the text as each stage completes. See `punctuation-service-v2-plan.md` for the server-side plan.
 
 ---
 
 ## Task Breakdown
 
-### 1. Punctuation Model Integration
+### 1. Adopt V2 Streaming Refinement
 
 | Field | Detail |
 |---|---|
-| **Estimate** | 4–5 days |
-| **Dependencies** | Phase 1 complete; ONNX Runtime already set up |
-| **Risk** | 🔴 High — Model selection, ONNX export compatibility, and inference quality are all unknowns until tested on device |
+| **Estimate** | 3–4 days (client); 4–6 days (server — tracked in `punctuation-service-v2-plan.md`) |
+| **Dependencies** | Phase 1 cloud punctuation integrated; `TranscriptRefinement` struct + `.refined` case already in place |
+| **Risk** | 🟡 Medium — mostly integration risk; the protocol is well-defined, but SSE stream lifecycle + retry idempotency have edge cases worth exercising |
 
-**Subtasks**:
+**Subtasks** (client-side; the server track is independent):
 
-- **1.1** Evaluate candidate models (1 day — research + quick benchmarks on laptop):
-  - **Option A**: `oliverguhr/fullstop-punctuation-multilingual-base` — download, test on sample Moonshine output, measure size (278M params full; need to quantize/distill)
-  - **Option B**: Ali CT-Transformer punctuation (from ManySpeech) — check if ONNX export exists, test compatibility
-  - **Option C**: Smaller alternatives on HuggingFace (`felflare/bert-restore-punctuation`, etc.)
-  - **Decision criteria**: Size on disk (target: < 120MB quantized), inference speed (target: < 50ms/utterance on device), quality on Moonshine-style output (lowercase, no punct, occasional word errors)
-- **1.2** Export/convert the chosen model to ONNX format:
-  - If PyTorch: use `torch.onnx.export` with dynamic axes for variable-length input
-  - Apply INT8 quantization (`onnxruntime.quantization`)
-  - Verify the quantized model produces acceptable output vs. the full-precision version
-- **1.3** Port or bundle the model's tokenizer for Swift:
-  - If BPE-based: use a lightweight Swift BPE tokenizer (or compile a C++ tokenizer and bridge)
-  - If SentencePiece: use the SentencePiece Swift/C++ library
-  - Test that tokenization matches the Python reference exactly (token ID mismatches → garbage output)
-- **1.4** Implement `PunctuationModel.swift`:
-  - Load ONNX model via `OrtSession` (can reuse the shared CoreML EP environment)
-  - Input: tokenized text → output: per-token label predictions
-  - Labels: `O`, `PERIOD`, `COMMA`, `QUESTION`, `EXCLAMATION`, `COLON`, each optionally combined with `CAPITALIZE`
-- **1.5** Implement `PunctuationRestorer.swift`:
-  - Tokenize raw ASR text
-  - Run inference
-  - Post-process: insert punctuation characters, apply capitalization
-  - Handle edge cases: sentence-initial capitalization, acronyms, numbers
-- **1.6** Implement `TextFormatter.swift` — additional rule-based formatting:
-  - Always capitalize "I"
-  - Capitalize after sentence-ending punctuation
-  - Handle common contractions ("i'm" → "I'm")
-  - Trim extra whitespace
-- **1.7** Benchmark on device:
-  - Measure inference time per utterance (varying lengths: 5, 15, 50, 100 words)
-  - Measure model loading time
-  - Verify total pipeline latency stays under 500ms target
+- **1.1** Ship Commit 1 (**DONE** — this session): rename `.punctuated` → `.refined`, introduce `TranscriptRefinement` carrying both `utteranceID` (provenance) and `segmentID` (UI upsert key, equal to `utteranceID` until the server starts splitting), merge the user-facing view into a single flowing paragraph. Retry path still single-shot against `/punctuate`; zero behaviour change.
+- **1.2** Ship Commit 2 (server): new `/punctuate/stream` endpoint emitting SSE events per stage (`commands` → `punct_case` → `itn`). Stateless. `segment_id` is deterministic `uuidv5(utteranceID, index)` so retries reproduce the same IDs and update in place. See v2 plan for the event shape.
+- **1.3** Ship Commit 3 (client): `PunctuationClient.punctuateStream(...)` returning `AsyncStream<PunctuationStageEvent>` via `URLSession.bytes(for:)`; teach `TranscriptionPipeline.dispatchFirstTryPunctuation` to consume the stream and yield one `.refined` update per stage. Each stage's text overwrites the prior stage for that `segmentID` — the UI sees the paragraph progressively improve.
+- **1.4** Retry hardening: `PendingPunctuation` grows a `segmentIDAtDispatch` field so retries replay with the same incoming segment id. Deterministic uuidv5 on the server makes this largely moot today (single-segment), but paying the cost now keeps the contract honest when splitting lands.
+- **1.5** Telemetry: per-stage latency logging (stage wall time, stream lifetime, partial vs. full completion). Keep client-side; no PII. Guard behind the existing debug view toggle.
+- **1.6** Smoke test end-to-end on simulator + physical device: verify mid-stream failures fall back cleanly to raw text, verify retries during server-down scenarios still produce the same rendered output.
 
-**Acceptance Criteria**: Punctuation model runs on device, adds periods/commas/question marks and capitalization to Moonshine output with reasonable accuracy. Inference < 50ms per utterance. Model size < 120MB on disk.
+**Acceptance Criteria**: User sees text progressively improve through commands → punct+case → ITN stages in real time. Stream failures degrade silently to raw local transcript. Retry queue survives server blips without producing duplicate or orphan segments in the UI.
 
 ---
 
-### 2. Three-Phase Text Rendering
+### 2. Progressive Paragraph Rendering
 
 | Field | Detail |
 |---|---|
-| **Estimate** | 3–4 days |
-| **Dependencies** | Task 1 (punctuation model working), Phase 1 Task 6 (basic UI exists) |
-| **Risk** | 🟡 Medium — Animating text transitions smoothly in SwiftUI while maintaining scroll position is tricky |
+| **Estimate** | 2–3 days |
+| **Dependencies** | Task 1.3 (streaming client wired); merged-paragraph view already in place |
+| **Risk** | 🟡 Medium — scroll-position preservation during frequent text updates is the hard part |
 
 **Subtasks**:
 
-- **2.1** Redesign `TranscriptUpdate` enum to support all three phases:
+- **2.1** `TranscriptUpdate` cases (current shape — no more redesign needed):
   ```
-  .partial(text, segmentId)    → gray, italic — ASR streaming
-  .finalized(text, segmentId)  → black, normal — punctuated result
-  .corrected(text, segmentId)  → highlight animation — cloud (Phase 3, but design for it now)
+  .partial(TranscriptPartial)       → secondary color, italic — ASR streaming
+  .finalized(TranscriptResult)      → raw local text, primary color
+  .refined(TranscriptRefinement)    → server-polished text, primary color, overwrites .finalized in-place
+  .failed(TranscriptFailure)        → small inline ⚠︎ marker
   ```
-- **2.2** Implement `LiveTextView.swift` — the core text display component:
-  - Renders an array of `TranscriptSegment` objects
-  - Each segment transitions through visual phases: partial → finalized
-  - Use `AttributedString` for per-segment styling
-  - Smooth transition animation when partial text is replaced by finalized text (crossfade or type-replace)
-- **2.3** Handle segment replacement gracefully:
-  - Partial text may differ from finalized text (ASR corrections + punctuation added)
-  - Avoid jarring jumps — animate the transition
-  - Maintain scroll position when earlier segments update
-- **2.4** Implement auto-scroll behavior:
-  - Auto-scroll to bottom when new text appears
-  - Pause auto-scroll if user scrolls up (they're reviewing earlier text)
-  - Resume auto-scroll when user scrolls back to bottom
-  - Show a "scroll to bottom" button when auto-scroll is paused
-- **2.5** Test with rapid speech: ensure UI stays responsive (60fps) even with frequent updates
+  With V2 streaming, `.refined` may fire multiple times per utterance (once per stage). Each one overwrites prior text keyed on `segmentID`. No new case needed.
+- **2.2** Auto-scroll behaviour for the merged paragraph:
+  - Stick to bottom when new text lands (final stage or partial growing)
+  - Pause auto-scroll if the user scrolls up to re-read earlier text
+  - Resume when they return to the bottom; show a "scroll to bottom" button when paused
+- **2.3** Subtle transition animation when a stage lands (e.g., briefly fade the delta, or just let SwiftUI's implicit animation handle the text change). Avoid type-by-type reveals — users perceive those as laggy.
+- **2.4** When paragraph splitting arrives (server emits a new `segmentID` mid-session), render a hard paragraph break in the UI. `Text(AttributedString)` handles this natively with `\n\n` inside the attributed string, or we move to a `VStack` of `Text` per segment. Decide at implementation time — don't over-engineer before the server supports it.
+- **2.5** Test with rapid dictation: paragraph stays at 60fps even when stage events arrive every ~30–50ms during cloud-refinement bursts.
 
-**Acceptance Criteria**: Live text view shows partial results in gray/italic, transitions smoothly to finalized punctuated text in black. Auto-scroll works intuitively. No frame drops during rapid transcription.
+**Acceptance Criteria**: Merged paragraph renders smoothly as stages land. Auto-scroll feels intuitive. No frame drops during rapid stage updates. Splitting (when shipped) produces clean paragraph breaks without disrupting scroll position.
 
 ---
 
@@ -302,16 +273,18 @@
 
 ```
 Phase 1 Complete
-  ├──► Task 1 (Punctuation Model) ──► Task 2 (Text Rendering) ──┐
-  ├──► Task 3 (Persistence) ──► Task 4 (Home View) ──────────────┤
-  │                        └──► Task 5 (Export) ──────────────────┤
-  ├──► Task 6 (Background Audio)                                  │
-  └──► Task 7 (Settings & Models)                                 │
-                                                                   │
-                                    Task 8 (Integration & Polish) ◄┘
+  ├──► Task 1 (V2 Streaming Refinement) ──► Task 2 (Progressive Rendering) ──┐
+  ├──► Task 3 (Persistence) ──► Task 4 (Home View) ───────────────────────────┤
+  │                        └──► Task 5 (Export) ───────────────────────────────┤
+  ├──► Task 6 (Background Audio)                                               │
+  └──► Task 7 (Settings & Model Mgmt)                                          │
+                                                                                │
+                                             Task 8 (Integration & Polish) ◄────┘
 ```
 
-Tasks 1, 3, 6, and 7 can all begin in parallel at the start of Phase 2 since they have no interdependencies. Task 2 (text rendering) depends on Task 1. Tasks 4 and 5 depend on Task 3. Task 8 requires all others to be substantially complete.
+Tasks 1, 3, 6, and 7 can all begin in parallel at the start of Phase 2 since they have no interdependencies. Task 2 (rendering) depends on Task 1.3 (streaming client wired). Tasks 4 and 5 depend on Task 3. Task 8 requires all others to be substantially complete.
+
+Note that Task 1 has a **server-side track** (V2 service — ITN, NeMo joint model, spoken commands) and a **client-side track** (SSE consumer, retry hardening). The tracks are independent; client can ship against the existing V1 `/punctuate` contract while server work is in flight, and gain streaming benefit incrementally as each server stage lands.
 
 ---
 
@@ -319,16 +292,16 @@ Tasks 1, 3, 6, and 7 can all begin in parallel at the start of Phase 2 since the
 
 | Task | Estimate | Risk | Parallelizable? |
 |---|---|---|---|
-| 1. Punctuation Model | 4–5 days | 🔴 High | Yes — start immediately |
-| 2. Three-Phase Text Rendering | 3–4 days | 🟡 Medium | After Task 1 |
+| 1. V2 Streaming Refinement | 3–4 days client + 4–6 days server | 🟡 Medium | Yes — start immediately |
+| 2. Progressive Paragraph Rendering | 2–3 days | 🟡 Medium | After Task 1.3 |
 | 3. SwiftData Persistence | 2–3 days | 🟢 Low | Yes — start immediately |
 | 4. Home View & Sessions | 2–3 days | 🟢 Low | After Task 3 |
 | 5. Export Functionality | 2–3 days | 🟢 Low | After Task 3 |
 | 6. Background Audio | 1–2 days | 🟡 Medium | Yes — start immediately |
 | 7. Settings & Model Mgmt | 2–3 days | 🟡 Medium | Yes — start immediately |
 | 8. Integration & Polish | 3–4 days | 🟡 Medium | After all others |
-| **Total** | **19–27 days** | | |
+| **Total** | **~18–26 days** (client) + **4–6 days** (server) | | |
 
-**Critical risk**: Task 1 (punctuation model). Model quality, size, and on-device performance are unknowns. **Recommendation**: Spend the first day of Phase 2 purely on model evaluation (Task 1.1) — test 2-3 candidate models on sample Moonshine output before committing to one. Have a fallback plan: a simple rule-based punctuator (regex + heuristics) that covers 80% of cases while a better model is being prepared for Phase 4.
+**Critical risk**: the V2 server upgrade (Task 1 server track). Swapping the punctuation model to NeMo joint DistilBERT, adding WFST-based ITN, and wiring spoken commands all have unknowns — cold-start times, label-space compatibility after ONNX export, and ITN over-normalization in particular. **Recommendation**: ship ITN first behind a feature flag (smallest change, biggest user-perceived win), keep V1's punctuation model as fallback until the NeMo swap is validated on an eval set. The client ships against V1's `/punctuate` throughout; the SSE client lands in parallel and activates the moment `/punctuate/stream` is live.
 
-**Parallelism opportunity**: With two developers, one could work Tasks 1→2 (punctuation pipeline) while the other works Tasks 3→4→5 (persistence + UI). Tasks 6 and 7 are smaller and can be picked up by whoever finishes first.
+**Parallelism opportunity**: one track per person — client streaming + rendering (Tasks 1-client → 2) alongside persistence + UI (Tasks 3 → 4 → 5). Background audio and settings can be filled in whenever. The server track runs independently.

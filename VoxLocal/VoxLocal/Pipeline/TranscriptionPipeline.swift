@@ -230,7 +230,7 @@ actor TranscriptionPipeline {
             )
             guard let self else { return }
             if let punctuated {
-                await self.handlePunctuationSuccess(punctuated)
+                await self.handleRefinementSuccess(punctuated)
             } else {
                 await self.enqueueForRetry(
                     utteranceID: result.utteranceID,
@@ -241,11 +241,11 @@ actor TranscriptionPipeline {
         }
     }
 
-    /// A punctuate call just landed. Publish the result and — if we have
-    /// a backlog — kick an immediate drain, since we just confirmed the
-    /// server is reachable.
-    private func handlePunctuationSuccess(_ p: TranscriptPunctuated) {
-        updatesContinuation.yield(.punctuated(p))
+    /// A refinement just landed. Publish it and — if we have a backlog —
+    /// kick an immediate drain, since we just confirmed the server is
+    /// reachable.
+    private func handleRefinementSuccess(_ r: TranscriptRefinement) {
+        updatesContinuation.yield(.refined(r))
         guard !pendingPunctuation.isEmpty else { return }
         retryTask?.cancel()
         retryTask = Task { [weak self] in
@@ -322,7 +322,7 @@ actor TranscriptionPipeline {
             if pendingPunctuation.first?.utteranceID == next.utteranceID {
                 pendingPunctuation.removeFirst()
             }
-            updatesContinuation.yield(.punctuated(punctuated))
+            updatesContinuation.yield(.refined(punctuated))
             drained += 1
         }
         return drained

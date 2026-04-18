@@ -226,16 +226,52 @@ struct TranscriptionView: View {
             emptyState
         } else {
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 12) {
-                    ForEach(model.rows) { row in
-                        TranscriptRowView(row: row)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                }
-                .padding(.horizontal)
-                .padding(.vertical, 8)
+                Text(paragraph)
+                    .font(.body)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+                    .padding(.horizontal)
+                    .padding(.vertical, 8)
             }
         }
+    }
+
+    /// Renders all rows as a single flowing paragraph. Finalized utterances
+    /// (raw or refined) concatenate in chronological order; the in-flight
+    /// `.partial`, if any, trails at the end in italic/secondary so the
+    /// user can see what's being transcribed right now. Failures get a
+    /// small red marker so they don't silently disappear from the flow.
+    ///
+    /// `model.rows` is newest-first (upsert inserts at index 0), so we
+    /// reverse for display. Until V2 splitting lands, everything in one
+    /// session is one segment, hence one paragraph.
+    private var paragraph: AttributedString {
+        var result = AttributedString("")
+        for row in model.rows.reversed() {
+            switch row.status {
+            case .partial:
+                appendSpaceIfNeeded(&result)
+                var partial = AttributedString(row.text.isEmpty ? "…" : row.text + " …")
+                partial.foregroundColor = .secondary
+                partial.inlinePresentationIntent = .emphasized
+                result.append(partial)
+            case .final:
+                guard !row.text.isEmpty else { continue }
+                appendSpaceIfNeeded(&result)
+                result.append(AttributedString(row.text))
+            case .failed:
+                appendSpaceIfNeeded(&result)
+                var marker = AttributedString("⚠︎")
+                marker.foregroundColor = .red
+                result.append(marker)
+            }
+        }
+        return result
+    }
+
+    private func appendSpaceIfNeeded(_ s: inout AttributedString) {
+        guard !s.characters.isEmpty else { return }
+        s.append(AttributedString(" "))
     }
 
     private var emptyState: some View {
@@ -296,44 +332,6 @@ struct TranscriptionView: View {
         let m = totalSeconds / 60
         let s = totalSeconds % 60
         return String(format: "%02d:%02d", m, s)
-    }
-}
-
-// MARK: - Row
-
-private struct TranscriptRowView: View {
-    let row: TranscriptRow
-
-    var body: some View {
-        switch row.status {
-        case .partial:
-            VStack(alignment: .leading, spacing: 2) {
-                Text(row.text.isEmpty ? "…" : row.text + " …")
-                    .font(.body.italic())
-                    .foregroundStyle(.secondary)
-            }
-        case .final(_, _, let punctuated):
-            VStack(alignment: .leading, spacing: 2) {
-                Text(row.text.isEmpty ? "(empty)" : row.text)
-                    .font(.body)
-                    .foregroundStyle(.primary)
-                if !punctuated {
-                    Text("raw")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
-            }
-        case .failed(let message):
-            VStack(alignment: .leading, spacing: 2) {
-                Label("transcription failed", systemImage: "exclamationmark.triangle.fill")
-                    .font(.body)
-                    .foregroundStyle(.red)
-                Text(message)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(3)
-            }
-        }
     }
 }
 

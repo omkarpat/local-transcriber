@@ -8,14 +8,14 @@ struct TranscriptionSession: Sendable, Equatable {
     let startedAt: Date
     private(set) var segments: [Segment] = []
 
-    /// One committed utterance. `text` is the punctuated version if the
+    /// One committed utterance. `text` is the refined version if the
     /// cloud service answered in time; otherwise the raw local transcript.
     struct Segment: Sendable, Equatable, Identifiable {
         let id: UUID                        // == utteranceID
         var text: String
         let utteranceDuration: Duration
         let capturedAt: Date
-        var isPunctuated: Bool
+        var isRefined: Bool
     }
 
     init(startedAt: Date = Date()) {
@@ -31,8 +31,8 @@ struct TranscriptionSession: Sendable, Equatable {
     }
 
     /// Append a finalized segment (first time we hear about it) or replace
-    /// its text when a `.punctuated` update arrives. `.partial` and
-    /// `.failed` are ignored here — session is the "clean record" view.
+    /// its text when a `.refined` update arrives. `.partial` and `.failed`
+    /// are ignored here — session is the "clean record" view.
     mutating func apply(_ update: TranscriptUpdate) {
         switch update {
         case .partial, .failed:
@@ -40,20 +40,20 @@ struct TranscriptionSession: Sendable, Equatable {
         case .finalized(let r):
             if let idx = segments.firstIndex(where: { $0.id == r.utteranceID }) {
                 segments[idx].text = r.text
-                segments[idx].isPunctuated = false
+                segments[idx].isRefined = false
             } else {
                 segments.append(Segment(
                     id: r.utteranceID,
                     text: r.text,
                     utteranceDuration: r.utteranceDuration,
                     capturedAt: Date(),
-                    isPunctuated: false
+                    isRefined: false
                 ))
             }
-        case .punctuated(let p):
-            guard let idx = segments.firstIndex(where: { $0.id == p.utteranceID }) else { return }
-            segments[idx].text = p.text
-            segments[idx].isPunctuated = true
+        case .refined(let r):
+            guard let idx = segments.firstIndex(where: { $0.id == r.utteranceID }) else { return }
+            segments[idx].text = r.text
+            segments[idx].isRefined = true
         }
     }
 }

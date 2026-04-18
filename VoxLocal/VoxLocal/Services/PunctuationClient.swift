@@ -3,7 +3,7 @@ import os
 
 /// HTTP client for the cloud punctuation service (see
 /// `punctuation-service-plan.md`). Fire-and-forget semantics: returns an
-/// optional `TranscriptPunctuated` on success, or `nil` on any failure
+/// optional `TranscriptRefinement` on success, or `nil` on any failure
 /// (timeout, network error, non-2xx, malformed body, empty input). The
 /// caller is expected to fall back silently to the raw local transcript
 /// when `nil` — no errors propagate to the UI.
@@ -34,7 +34,7 @@ nonisolated final class PunctuationClient: @unchecked Sendable {
         utteranceID: UUID,
         text: String,
         utteranceDuration: Duration
-    ) async -> TranscriptPunctuated? {
+    ) async -> TranscriptRefinement? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
 
@@ -62,9 +62,13 @@ nonisolated final class PunctuationClient: @unchecked Sendable {
             }
             let decoded = try JSONDecoder().decode(PunctuateResponse.self, from: data)
             let elapsed = Duration.seconds(Date().timeIntervalSince(start))
-            return TranscriptPunctuated(
+            return TranscriptRefinement(
                 id: UUID(),
                 utteranceID: utteranceID,
+                // V2 single-segment: segmentID == utteranceID. When the
+                // streaming endpoint lands, segmentIDs will come from the
+                // server (deterministic uuidv5 seeded from utteranceID).
+                segmentID: utteranceID,
                 text: decoded.text,
                 sourceText: text,
                 utteranceDuration: utteranceDuration,

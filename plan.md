@@ -26,47 +26,62 @@ A transcription app that runs entirely on-device, delivering real-time speech-to
 
 ## 2. Architecture Overview
 
-The app uses a two-stage on-device pipeline: a streaming ASR model for fast word recognition, followed by a lightweight punctuation restoration model for formatting. An optional cloud layer provides deeper correction.
+The app uses a local-first pipeline: streaming ASR on-device for fast word recognition, with punctuation + refinement delivered by an optional cloud service via streaming HTTP. The cloud service is a quality enhancer — the app is fully functional with the raw ASR transcript when offline.
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                       iOS App                                │
-│                                                              │
-│  ┌──────────┐    ┌──────────────┐    ┌───────────────────┐  │
-│  │ Audio    │───►│ VAD          │───►│ Moonshine v2      │  │
-│  │ Capture  │    │ (Silero)     │    │ Streaming ASR     │  │
-│  │ (AVAudio │    │              │    │ (ONNX Runtime +   │  │
-│  │  Engine) │    │ Filters      │    │  CoreML EP)       │  │
-│  │          │    │ silence,     │    │                   │  │
-│  │ 16kHz    │    │ segments     │    │ Outputs:          │  │
-│  │ mono     │    │ utterances   │    │ raw lowercase     │  │
-│  └──────────┘    └──────────────┘    │ text, no punct    │  │
-│                                       └────────┬──────────┘  │
-│                                                │              │
-│                                       ┌────────▼──────────┐  │
-│                                       │ Punctuation Model │  │
-│  ┌──────────────┐                     │ (On-Device)       │  │
-│  │ Display      │◄────────────────────│                   │  │
-│  │ Layer        │                     │ Token classifier  │  │
-│  │              │                     │ ~15-30M params    │  │
-│  │ - Live       │                     │ Adds . , ? ! :    │  │
-│  │   partial    │                     │ and Capitalization │  │
-│  │   results    │                     └────────┬──────────┘  │
-│  │ - Finalized  │                              │              │
-│  │   punctuated │                     ┌────────▼──────────┐  │
-│  │   text       │                     │ Cloud Correction  │  │
-│  │ - Cloud-     │◄────────────────────│ (Optional)        │  │
-│  │   corrected  │                     │ WebSocket → AWS   │  │
-│  │   text       │                     │ Bedrock           │  │
-│  └──────────────┘                     └───────────────────┘  │
-│                                                              │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │ Local Storage (SwiftData / Core Data)                 │   │
-│  │ - Session transcripts    - User preferences           │   │
-│  │ - Offline correction     - Export history              │   │
-│  │   queue                                               │   │
-│  └──────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                        iOS App                                │
+│                                                               │
+│  ┌──────────┐    ┌──────────────┐    ┌────────────────────┐  │
+│  │ Audio    │───►│ VAD          │───►│ Moonshine v2       │  │
+│  │ Capture  │    │ (Silero)     │    │ Streaming ASR      │  │
+│  │ (AVAudio │    │              │    │ (ONNX Runtime +    │  │
+│  │  Engine) │    │ Filters      │    │  CoreML EP)        │  │
+│  │          │    │ silence,     │    │                    │  │
+│  │ 16kHz    │    │ segments     │    │ Outputs:           │  │
+│  │ mono     │    │ utterances   │    │ raw lowercase      │  │
+│  └──────────┘    └──────────────┘    │ text, no punct     │  │
+│                                       └─────────┬──────────┘  │
+│                                                 │              │
+│  ┌──────────────┐                     ┌─────────▼──────────┐  │
+│  │ Display      │◄────────partials────│                    │  │
+│  │ Layer        │◄────────finalized───│ TranscriptionPipe- │  │
+│  │              │                     │ line (actor)       │  │
+│  │ - Live       │                     │                    │  │
+│  │   partial    │         refinements ├────────────┐       │  │
+│  │   (italic)   │◄────────────────────┤            │       │  │
+│  │ - Finalized  │                     │  Fires     │       │  │
+│  │   raw text   │                     │  HTTP+SSE  │       │  │
+│  │ - Refined    │                     │  request   │       │  │
+│  │   (merged    │                     │  per       │       │  │
+│  │   paragraph) │                     │  finalized │       │  │
+│  └──────────────┘                     │  utterance │       │  │
+│                                       └────────────┼───────┘  │
+│  ┌──────────────────────────────────────────────┐  │          │
+│  │ Local Storage (SwiftData)                     │  │          │
+│  │ - Session transcripts                         │  │          │
+│  │ - Retry queue for offline refinement          │  │          │
+│  │ - User preferences                            │  │          │
+│  └──────────────────────────────────────────────┘  │          │
+└─────────────────────────────────────────────────────┼──────────┘
+                                                      │
+                                          HTTP POST + SSE stream
+                                          (X-API-Key auth)
+                                                      │
+┌─────────────────────────────────────────────────────▼──────────┐
+│  Punctuation Refinement Service (ECS Fargate, stateless)       │
+│                                                                 │
+│  FastAPI + ONNX Runtime (CPU-only, INT8 quantized)             │
+│                                                                 │
+│  Stage 1: Spoken commands  ("comma" → ",", "new paragraph")    │
+│     │                                                           │
+│  Stage 2: Punct + truecasing  (NeMo joint DistilBERT)          │
+│     │                                                           │
+│  Stage 3: ITN  (NeMo Text Processing — "twenty twenty six"     │
+│                 → "2026", "five dollars" → "$5")               │
+│                                                                 │
+│  Each stage emits an SSE event. Client renders progressively.   │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -143,141 +158,97 @@ AVAudioEngine (input node)
 
 ---
 
-## 4. On-Device Punctuation Restoration
+## 4. Punctuation & Refinement: Cloud Service
 
 ### The Problem
 
-Moonshine outputs raw lowercase text: `so the main thing we need to discuss today is the quarterly budget`. We need: `So the main thing we need to discuss today is the quarterly budget.`
+Moonshine outputs raw lowercase text: `so the main thing we need to discuss today is the quarterly budget`. We need: `So, the main thing we need to discuss today is the quarterly budget.`
 
-### Approach: Lightweight Token Classifier
+### Approach: Stateless Cloud Service (Not On-Device)
 
-A punctuation restoration model is a token-level classifier: for each word, predict what punctuation follows it (if any) and whether the next word should be capitalized.
+**Design decision (revised)**: Punctuation + formatting runs in a cloud service, not on-device. Earlier versions of this plan proposed a distilled BERT-tiny running locally; in practice a small stateless FastAPI service running on ECS CPU tasks delivered better accuracy, shorter time-to-ship, and zero on-device memory/battery cost — at the price of a ~100ms network RTT and a silent fallback when offline. Both tradeoffs were worth it.
 
-**Label set**: `O` (nothing), `PERIOD`, `COMMA`, `QUESTION`, `EXCLAMATION`, `COLON`, `CAPITALIZE` (can be combined: `PERIOD+CAPITALIZE`).
+The service is **optional**. When offline or on server failure the app shows the raw ASR transcript. No UI error — silent fallback preserves the local-first promise.
 
-### Model Options (Ranked by Mobile Feasibility)
+### Service Architecture: V1 (Shipped)
 
-#### Option A: Distilled BERT-Tiny Punctuation (Recommended for v1)
+- **Runtime**: FastAPI + ONNX Runtime (CPU, INT8 quantized XLM-R base)
+- **Endpoint**: `POST /punctuate` — single request/response with punctuated + regex-cased text
+- **Deployment**: ECS Fargate (`c7g.xlarge`), ALB, single-AZ for now
+- **Auth**: shared `X-API-Key` header; no per-user auth yet
+- **Model**: `oliverguhr/fullstop-punctuation-multilingual-base`, INT8 ONNX
 
-- **Base model**: A pruned/distilled XLM-RoBERTa or BERT-tiny (~15-30M params)
-- **Size on disk**: ~60-120MB (INT8 quantized ONNX)
-- **Inference time**: <50ms per utterance on iPhone (CoreML)
-- **Training data**: Generate pairs from clean text (punctuated) → strip punctuation → train classifier
-- **Existing starting point**: `oliverguhr/fullstop-punctuation-multilingual-base` (278M params) can be distilled down
+See `punctuation-service-plan.md` for the V1 service detail.
 
-#### Option B: Ali CT-Transformer Punctuation
+### Service Architecture: V2 (In Progress)
 
-- Used by the ManySpeech library specifically to complement Moonshine
-- Available as ONNX
-- Designed for CTC/transducer model output
+V2 keeps the same deployment shape but adds three pipeline stages and a streaming wire contract:
 
-#### Option C: Custom Fine-Tuned Tiny Model (Recommended for v2)
+1. **Stage 1 — Spoken commands**: "comma" → ",", "new paragraph" → segment break
+2. **Stage 2 — Punct + truecasing**: swap XLM-R for NeMo joint DistilBERT (English-only; kills the regex casing step)
+3. **Stage 3 — ITN**: NeMo Text Processing for "twenty twenty six" → "2026", "five dollars" → "$5"
 
-- Fine-tune a ~15M param model on Moonshine-specific output
-- Training pipeline: Clean text → TTS → Moonshine → noisy transcript → correction pairs
-- This captures Moonshine's specific error distribution (what words it tends to get wrong, where it splits utterances)
-- Your QLoRA/fine-tuning experience maps directly to this task
+And a new endpoint:
 
-### Punctuation Pipeline Integration
+- **`POST /punctuate/stream`** — returns `text/event-stream` with one `event: stage` per pipeline stage. Client renders progressively-improved text as each stage lands.
+
+See `punctuation-service-v2-plan.md` for the V2 plan including the wire contract, two-ID model (utteranceID + segmentID), deterministic uuidv5 segment IDs for retry idempotency, and stateless-server rationale.
+
+### Client Integration (iOS)
 
 ```swift
-class PunctuationRestorer {
-    private let session: OrtSession  // ONNX Runtime session
-    private let tokenizer: BPETokenizer
+// PunctuationClient.swift — existing V1 client (single-shot)
+func punctuate(
+    utteranceID: UUID,
+    text: String,
+    utteranceDuration: Duration
+) async -> TranscriptRefinement?
 
-    func restore(_ rawText: String) -> String {
-        // 1. Tokenize input
-        let tokens = tokenizer.encode(rawText)
-
-        // 2. Run inference → per-token label predictions
-        let labels = runInference(tokens)
-
-        // 3. Post-process: insert punctuation, apply capitalization
-        return applyLabels(rawText, labels)
-    }
-}
+// V2 addition — streaming consumer via URLSession.bytes(for:)
+func punctuateStream(
+    utteranceID: UUID,
+    text: String
+) -> AsyncStream<PunctuationStageEvent>
 ```
+
+`TranscriptionPipeline` fires a request per finalized utterance and yields `.refined(TranscriptRefinement)` updates onto its `updates` stream. Each refinement carries both `utteranceID` (provenance) and `segmentID` (UI upsert key). Today they're equal; when the server starts splitting on "new paragraph" commands, `segmentID` diverges and the UI renders multiple paragraphs per utterance without any client changes.
+
+### Retry Semantics
+
+When a request fails (timeout, non-2xx, mid-stream drop), the utterance is enqueued on a per-pipeline retry queue with exponential backoff (5s → 60s cap). Deterministic server-side segment IDs (`uuidv5(utteranceID, index)`) mean a replayed utterance produces the same segment IDs as the first attempt, so retries update in place rather than creating orphan rows.
 
 ### Latency Budget
 
-The entire pipeline from audio → displayed punctuated text should be under 500ms:
+Audio → displayed raw text target: <500ms (on-device only).
+Audio → displayed refined text target: <700ms p50 for 30–60 token utterances.
 
 | Stage | Target Latency | Notes |
 |---|---|---|
 | Audio capture → VAD | ~100ms | Silero VAD processes 30ms frames |
-| VAD → Moonshine ASR | ~150-200ms | Streaming partial results |
-| ASR → Punctuation model | ~30-50ms | Token classifier on completed utterance |
-| UI update | ~16ms | Main thread, next frame |
-| **Total** | **~300-370ms** | Well within conversational feel |
+| VAD → Moonshine ASR | ~150–200ms | Streaming partial results |
+| **Raw text displayed** | **~250–300ms** | Local path complete here |
+| POST → SSE first byte | ~20–40ms | ALB + LAN |
+| Stage 1 commands | ~1ms | Rule-based |
+| Stage 2 punct+case | ~60–90ms | NeMo DistilBERT INT8 |
+| Stage 3 ITN | ~5–20ms | WFST traversal |
+| **Refined text displayed** | **~400–500ms** | Within conversational feel |
+
+Network tail events (500ms+) fall back silently to the raw transcript via the retry queue.
 
 ---
 
-## 5. Optional Cloud Correction Layer
+## 5. Future Cloud Capability: LLM Correction (Phase 4+)
 
-### When Cloud Adds Value
+V1 and V2 punctuation services handle *formatting* problems. Neither can fix ASR recognition errors — homophones like "405" → "four or five", out-of-vocabulary terms, proper-noun confusions. Those need either a better ASR (Moonshine retraining or contextual biasing) or an LLM rewrite pass with world knowledge.
 
-- Correcting ASR word errors (homophones, rare words, proper nouns)
-- Improving punctuation on ambiguous sentences
-- Inverse text normalization (e.g., "five dollars" → "$5")
-- Domain-specific terminology
+**This layer is deferred to Phase 4+.** When it arrives, the candidate architecture is:
 
-### Architecture: API Gateway WebSocket + Lambda + Bedrock
+- **Deployment**: HTTP POST to a separate Bedrock-backed endpoint (or direct API call depending on latency requirements)
+- **Invocation rule**: opt-in per session or triggered by a low-confidence signal; V2's deterministic pipeline runs first and returns immediately
+- **Contract**: extend the V2 SSE stream with an optional `event: stage` carrying `stage: "llm_correction"`. The client already renders progressively, so adding one more late-arriving event is a no-op on the UI.
+- **Budget**: 500ms–2s p99 is acceptable because this stage runs *after* the deterministic pipeline has already shown text. Network tail doesn't stall the UI.
 
-```
-iOS App
-  ↕ WSS (persistent connection)
-API Gateway WebSocket
-  → $connect: Auth Lambda (Cognito JWT validation)
-  → transcribe: Orchestrator Lambda
-      → Bedrock (Claude Haiku / Amazon Nova Micro)
-      → Verify correction via edit-distance
-      → POST back via @connections/{connectionId}
-  → heartbeat: no-op (keeps connection alive)
-  → $disconnect: Cleanup Lambda
-```
-
-### Protocol
-
-```json
-// Client → Server
-{
-    "action": "transcribe",
-    "sessionId": "sess_abc123",
-    "sequenceNum": 42,
-    "text": "So the main thing we need to discuss today is the quarterly budget.",
-    "isFinal": true,
-    "timestampMs": 1713275400000
-}
-
-// Server → Client
-{
-    "type": "correction",
-    "sessionId": "sess_abc123",
-    "sequenceNum": 42,
-    "correctedText": "So, the main thing we need to discuss today is the quarterly budget.",
-    "changes": ["added_comma:4"],
-    "latencyMs": 230
-}
-```
-
-### Connection Lifecycle
-
-- **Session start**: App opens WebSocket if online. Falls back to local-only if offline.
-- **Heartbeat**: Every 5 minutes to prevent API Gateway's 10-minute idle timeout.
-- **Hard limit**: API Gateway enforces a 2-hour max connection duration. For sessions >2 hours, implement auto-reconnect with `sessionId` + `lastSequenceNum` to resume without loss.
-- **Offline queue**: If the connection drops, completed utterances queue locally (SwiftData) and flush when reconnected.
-- **Graceful degradation**: Cloud corrections are applied as "upgrades" to already-displayed local text. The UI animates the transition subtly (e.g., a brief highlight on changed words).
-
-### AWS Cost Estimate (MVP Scale)
-
-| Component | Unit Cost | 1,000 sessions/month (1hr each) |
-|---|---|---|
-| API GW connection minutes | $0.25/M minutes | $0.015 |
-| API GW messages | $1.00/M messages | ~$0.72 |
-| Lambda invocations | $0.20/M + compute | ~$2.00 |
-| Bedrock (Haiku) tokens | ~$0.25/M input, $1.25/M output | ~$5-10 |
-| DynamoDB | On-demand pricing | ~$1.00 |
-| **Total** | | **~$10-15/month** |
+Earlier versions of this plan specified WebSocket + API Gateway + Bedrock + Cognito as the main cloud path. That architecture is shelved — the stateless HTTP+SSE shape we're using for V1/V2 is simpler, faster to iterate on, and extends cleanly into Phase 4's LLM fallback. Cognito auth, per-user sessions, and WebSocket connection management become relevant only if we add features that actually need them (e.g., bidirectional streaming, live collaboration).
 
 ---
 
@@ -314,17 +285,12 @@ VoxLocal/
 │   ├── TranscriptSegment.swift      # Data model: text, timestamps, confidence
 │   └── ModelManager.swift           # Model download, storage, version management
 │
-├── Punctuation/
-│   ├── PunctuationModel.swift       # ONNX Runtime inference for punct model
-│   ├── PunctuationRestorer.swift    # Token classification + post-processing
-│   └── TextFormatter.swift          # Capitalization rules, edge cases
-│
-├── Cloud/
-│   ├── WebSocketManager.swift       # URLSessionWebSocketTask wrapper
-│   ├── CloudCorrectionService.swift # Send utterance, receive correction
-│   ├── ConnectionState.swift        # Connected/disconnected/reconnecting
-│   ├── OfflineQueue.swift           # Queue corrections for when back online
-│   └── CorrectionProtocol.swift     # JSON message encoding/decoding
+├── Services/
+│   ├── PunctuationClient.swift      # HTTP + SSE client for the cloud
+│   │                                # refinement service. Single-shot
+│   │                                # `punctuate()` for V1; streaming
+│   │                                # `punctuateStream()` for V2.
+│   └── PunctuationConfig.swift      # Endpoint + API key config
 │
 ├── Pipeline/
 │   ├── TranscriptionPipeline.swift  # Orchestrates Audio→VAD→ASR→Punct→Cloud
@@ -357,26 +323,35 @@ VoxLocal/
 ```swift
 // Thread-safe transcription pipeline orchestrator
 actor TranscriptionPipeline {
-    private let audioCapture: AudioCaptureManager
-    private let vad: VADProcessor
-    private let asr: MoonshineTranscriber
-    private let punctuation: PunctuationRestorer
-    private let cloud: CloudCorrectionService?
+    private let manager: AudioCaptureManager
+    private let transcriber: MoonshineTranscriber       // ASR (long-lived)
+    private let punctuationClient: PunctuationClient    // cloud refinement (long-lived)
+    private var vad: VADProcessor?                      // per-session
 
-    // Published stream of transcript updates for the UI
-    let transcriptStream: AsyncStream<TranscriptUpdate>
+    // Published streams for the UI
+    let updates: AsyncStream<TranscriptUpdate>          // partial/final/refined
+    let events: AsyncStream<PipelineEvent>              // started/stopped/speech
 
-    func startSession(config: PipelineConfiguration) async throws { ... }
-    func stopSession() async -> SessionRecord { ... }
+    func start(configuration: PipelineConfiguration) async throws { ... }
+    func stop() { ... }
 }
 
 // Transcript update types the UI observes
 enum TranscriptUpdate {
-    case partial(text: String, segmentId: UUID)           // ASR streaming partial
-    case finalized(text: String, segmentId: UUID)         // ASR final + punctuated
-    case corrected(text: String, segmentId: UUID)         // Cloud-corrected
-    case error(TranscriptionError)
+    case partial(TranscriptPartial)           // ASR streaming partial (italic)
+    case finalized(TranscriptResult)          // ASR final, raw local text
+    case refined(TranscriptRefinement)        // Cloud-polished; may fire multiple
+                                              // times per utterance as each V2 stage
+                                              // (commands → punct+case → ITN) lands
+    case failed(TranscriptFailure)
 }
+
+// Each refinement carries two IDs. `utteranceID` is provenance (which ASR
+// utterance this came from — used for retries). `segmentID` is the UI
+// upsert key (which paragraph this text renders in). They're equal until
+// the V2 server starts splitting utterances on "new paragraph" commands,
+// at which point one utterance can produce multiple segments and the UI
+// renders multiple paragraphs — without any client changes.
 ```
 
 ### Background Audio
@@ -399,13 +374,14 @@ try audioSession.setActive(true)
 
 ### Live Transcription View
 
-- **Streaming text**: Words appear at the bottom of a scrolling text view as they're spoken. The view auto-scrolls to follow.
-- **Three-phase rendering**:
-    1. **Partial** (gray, italic): ASR streaming output, may change
-    2. **Finalized** (black, normal): Punctuated local result
-    3. **Corrected** (black, normal, brief highlight): Cloud-enhanced, subtle animation on changed words
-- **Confidence indicator**: Optional subtle underline on low-confidence words (tap to see alternatives).
-- **Pause/resume**: Single tap to pause, tap again to resume. Audio continues recording during pause for seamless playback.
+- **Merged paragraph**: The transcript is a single flowing paragraph, not a list of utterance rows. Finalized utterances concatenate chronologically; the in-flight partial trails at the end in italic. This matches how dictated text reads and leaves room for future paragraph breaks driven by the V2 server.
+- **Update phases** on each segment:
+    1. **Partial** (secondary color, italic): ASR streaming output, may change
+    2. **Finalized raw** (primary color): Local ASR result, no punctuation
+    3. **Refined** (primary color, overwrites in place): Each cloud pipeline stage progressively improves the segment — commands → punct+case → ITN. With V2 SSE streaming, users see text improve in real time rather than jumping from raw to fully-polished in one update.
+- **Segment identity**: Each refinement is keyed by `segmentID`. In V2 single-segment mode every utterance is its own segment and they all concatenate into one paragraph. When the V2 server starts emitting new segment IDs on spoken "new paragraph" commands (or cross-utterance silence), the UI renders paragraph breaks automatically with no client changes.
+- **Auto-scroll**: Stick to bottom on new text; pause when the user scrolls up to re-read; resume when they return to the bottom. Show a "scroll to bottom" button when paused.
+- **Pause/resume recording**: Single tap to pause, tap again to resume.
 
 ### Session Management
 
@@ -459,73 +435,70 @@ App Launch
 
 ## 9. Development Phases
 
-### Phase 1: Core Local Pipeline (Weeks 1-4)
+### Phase 1: Core Local Pipeline + V1 Refinement (Weeks 1-4) — DONE except device testing
 
-**Goal**: Mic → ASR → text on screen, fully on-device.
+**Goal**: Mic → ASR → text on screen, fully on-device. Plus V1 cloud refinement as a silent-fallback HTTP service.
 
-- [ ] Set up Xcode project, ONNX Runtime Swift package
-- [ ] Implement `AudioCaptureManager` with AVAudioEngine
-- [ ] Integrate Silero VAD via ONNX Runtime
-- [ ] Integrate Moonshine Tiny via ONNX Runtime + CoreML EP
-- [ ] Build `TranscriptionPipeline` actor orchestrating Audio → VAD → ASR
-- [ ] Build minimal `TranscriptionView` showing streaming text
+- [x] Set up Xcode project, ONNX Runtime Swift package
+- [x] Implement `AudioCaptureManager` with AVAudioEngine
+- [x] Integrate Silero VAD via ONNX Runtime
+- [x] Integrate Moonshine Tiny via ONNX Runtime + CoreML EP
+- [x] Build `TranscriptionPipeline` actor orchestrating Audio → VAD → ASR
+- [x] Build minimal `TranscriptionView` showing streaming text
+- [x] Deploy V1 `POST /punctuate` service (FastAPI + ONNX on CPU); integrate `PunctuationClient` with silent fallback and retry queue
 - [ ] Test on physical device (iPhone 14+): verify real-time performance
 - [ ] Measure battery drain over 30-minute session
 
-**Exit criteria**: User can record speech and see raw (unpunctuated) transcript appear in real-time, fully offline, on an iPhone.
+**Exit criteria**: User can record speech and see raw transcript appear in real-time, fully offline. When online, the transcript upgrades to punctuated + cased text via cloud refinement, with no UI disruption on server failures.
 
-### Phase 2: Punctuation & Polish (Weeks 5-7)
+### Phase 2: V2 Streaming Refinement + Persistence + UX (Weeks 5-7)
 
-**Goal**: Add punctuation restoration, session persistence, basic UX.
+**Goal**: Upgrade cloud refinement to progressive SSE streaming; add session persistence, export, and polish.
 
-- [ ] Integrate or train punctuation model (start with Ali CT-Transformer or distilled BERT)
-- [ ] Run punctuation model as second pass on finalized utterances
-- [ ] Implement three-phase text rendering (partial → finalized → punctuated)
-- [ ] Build SwiftData persistence layer for sessions
-- [ ] Build `HomeView` with session list
-- [ ] Implement export (clipboard, .txt, share sheet)
-- [ ] Add background audio support
-- [ ] Add Moonshine Base as downloadable "HD" model option
+See `phase2-plan.md` for the detailed task breakdown.
 
-**Exit criteria**: User gets punctuated, capitalized transcripts. Sessions are saved and exportable. App works in background.
+- [ ] Task 1: Adopt V2 streaming refinement
+    - Commit 1 (**DONE**): rename `.punctuated` → `.refined`; introduce `TranscriptRefinement` with `utteranceID` + `segmentID`; merge user-facing view into a single flowing paragraph
+    - Commit 2: server `POST /punctuate/stream` with SSE + deterministic uuidv5 segment IDs (tracked in `punctuation-service-v2-plan.md`)
+    - Commit 3: client `PunctuationClient.punctuateStream()` via `URLSession.bytes(for:)`, wire into pipeline
+- [ ] Task 2: Progressive paragraph rendering (auto-scroll, stage transitions, paragraph breaks when server splits)
+- [ ] Task 3: SwiftData persistence for sessions
+- [ ] Task 4: `HomeView` with session list
+- [ ] Task 5: Export (.txt, .srt, .vtt, clipboard, share sheet)
+- [ ] Task 6: Background audio
+- [ ] Task 7: Settings + Moonshine Base "HD" model download
 
-### Phase 3: Cloud Correction (Weeks 8-10)
+**Exit criteria**: User sees text progressively improve across stages (commands → punct+case → ITN) with deterministic fallback to raw on server failures. Sessions are saved and exportable. App works in background.
 
-**Goal**: Optional cloud enhancement via AWS.
+### Phase 3: V2 Server Stages & Eval (Weeks 8-10)
 
-- [ ] Deploy AWS infrastructure (CDK/Terraform):
-    - API Gateway WebSocket
-    - Lambda functions ($connect, transcribe, $disconnect)
-    - Bedrock model access (Claude Haiku / Nova Micro)
-    - DynamoDB session table
-    - Cognito user pool
-- [ ] Implement `WebSocketManager` with auto-reconnect + heartbeat
-- [ ] Implement `CloudCorrectionService` with offline queue
-- [ ] Build correction verification (edit-distance check in Lambda)
-- [ ] Design and implement correction prompt for Bedrock
-- [ ] Add cloud toggle in Settings
-- [ ] Implement correction animation in `LiveTextView`
-- [ ] Test: 1-hour session with intermittent connectivity
+**Goal**: Ship the three V2 pipeline stages behind feature flags, with labeled eval on real Moonshine output.
 
-**Exit criteria**: Cloud corrections visibly improve transcript quality. App degrades gracefully to local-only when offline.
+See `punctuation-service-v2-plan.md` for the service-side plan.
 
-### Phase 4: Fine-Tuning & Optimization (Weeks 11-14)
+- [ ] Wire the SSE contract in production (start by emitting a single `stage: "full"` event wrapping V1 output — no behaviour change, just contract)
+- [ ] Ship ITN as Stage 3 (NeMo Text Processing); emit dedicated `stage: "itn"` event
+- [ ] Swap XLM-R → NeMo joint DistilBERT for punct+case; A/B on labeled eval set; gate behind flag
+- [ ] Add Stage 1 spoken commands; build labeled eval set for precision/recall tuning
+- [ ] Wire deterministic `silence_before_ms` from client VAD timeline to enable cross-utterance paragraph splits
+- [ ] Observability: per-stage latency histograms, p50/p95/p99/p999 tracked separately
 
-**Goal**: Custom punctuation model, performance optimization, App Store readiness.
+**Exit criteria**: All three stages in production behind flags with documented quality wins on labeled eval. p99 < 250ms for 30–60 token inputs. No regression on V1 punctuation F1.
 
-- [ ] Build synthetic training data pipeline:
-    - Clean text corpus → strip punctuation → Moonshine output pairs
-    - Use TTS to generate audio, run through Moonshine, collect error patterns
-- [ ] Fine-tune/distill a tiny punctuation model (~15M params) for Moonshine output
-- [ ] Quantize to INT8, convert to ONNX, benchmark on device
+### Phase 4: LLM Correction Layer & Optimization (Weeks 11-14)
+
+**Goal**: Add optional LLM correction for ASR errors (homophones, proper nouns), plus polish for App Store.
+
+- [ ] Design LLM-correction endpoint as Phase 3 SSE extension (one more stage event, runs after deterministic pipeline)
+- [ ] Deploy Bedrock-backed (Claude Haiku) or direct-API correction service
+- [ ] Wire opt-in per-session flag; route low-confidence utterances only (telemetry-driven threshold)
 - [ ] Profile and optimize memory usage (Instruments → Allocations)
 - [ ] Profile and optimize battery drain (Instruments → Energy Log)
-- [ ] Optimize model cold-start time (memory-mapped ONNX, lazy loading)
 - [ ] Accessibility audit (VoiceOver, Dynamic Type)
 - [ ] App Store assets, screenshots, privacy policy
 - [ ] TestFlight beta
 
-**Exit criteria**: Polished app with custom punctuation model, optimized for battery/memory, ready for App Store submission.
+**Exit criteria**: LLM correction visibly fixes recognition errors on an opt-in basis without regressing latency for the common path. Polished, battery/memory-optimized app ready for App Store submission.
 
 ---
 
@@ -583,16 +556,16 @@ App Launch
 
 ### AWS Services (Cloud Component)
 
-| Service | Purpose |
-|---|---|
-| API Gateway (WebSocket) | Persistent client connection |
-| Lambda (Python 3.12) | Orchestration, auth, correction logic |
-| Amazon Bedrock | LLM inference for text correction |
-| DynamoDB | Session state, connection mapping |
-| Cognito | Mobile authentication |
-| CloudWatch | Monitoring and alerting |
-| S3 | Model hosting CDN origin |
-| CloudFront | Model download CDN |
+| Service | Purpose | Phase |
+|---|---|---|
+| ECS Fargate (`c7g.xlarge`) | Run the FastAPI refinement service (CPU-only ONNX inference) | 1 |
+| Application Load Balancer | Terminate HTTPS, auth via `X-API-Key`, route to ECS tasks | 1 |
+| ECR | Container image registry for the service | 1 |
+| CloudWatch | Task + latency histograms, alarm on error rate | 1 |
+| S3 + CloudFront | Model artifact hosting (ONNX weights, tokenizer, labels.json) | 1 |
+| Amazon Bedrock | Optional LLM correction pass (Phase 4) | 4 |
+
+Deferred until a concrete feature needs them: API Gateway (only if WebSockets become necessary), Cognito (only if per-user auth becomes necessary), DynamoDB (only if session-level server state becomes necessary). V1/V2 deliberately avoid all three.
 
 ---
 
@@ -601,8 +574,9 @@ App Launch
 | Risk | Impact | Likelihood | Mitigation |
 |---|---|---|---|
 | Moonshine ONNX + CoreML EP performance insufficient | Users see lag | Medium | Fall back to CPU EP; benchmark early in Phase 1; keep Whisper as backup |
-| Punctuation model too large for device | Exceeds memory budget | Low | Quantize aggressively (INT4); distill smaller; use simpler rule-based fallback |
-| API Gateway 2-hour WebSocket limit | Long sessions disconnect | Medium | Auto-reconnect with sessionId + sequenceNum; tested in Phase 3 |
+| Cloud refinement service tail latency (network or task churn) | Text takes too long to polish | Medium | Silent fallback to raw local transcript; retry queue handles server blips; hard 2s client timeout keeps the UI responsive |
+| V2 NeMo model ONNX export loses label mappings | Service returns garbled text | Medium | Ship `labels.json` alongside the model; verify round-trip in CI; gate the swap behind a feature flag |
+| Spoken command false positives ("comma" → ",") | Text looks worse, not better | Medium | Precision-first tuning (>95% precision target even at 80% recall); labeled eval set on real Moonshine output before launch |
 | Moonshine hallucinations on silence/noise | Phantom text appears | Medium | Silero VAD filters silence; implement token-rate heuristic to detect repetition |
 | App Store review: large model download on first launch | Rejection | Low | Offer "download models" screen with clear size disclosure; comply with cellular download limits |
 | Battery drain exceeds user tolerance | Negative reviews | Medium | Profile early; offer "battery saver" mode with Tiny model + lower sample rate |

@@ -2,11 +2,11 @@ import Foundation
 
 /// SwiftUI-shaped projection of `TranscriptUpdate`. One row per utterance,
 /// keyed on `utteranceID` so `ForEach` can upsert in place as
-/// `.partial` → `.finalized` → `.punctuated` arrive.
+/// `.partial` → `.finalized` → `.refined` arrive.
 struct TranscriptRow: Identifiable, Equatable {
     enum Status: Equatable {
         case partial
-        case final(tokenCount: Int, realTimeFactor: Double, isPunctuated: Bool)
+        case final(tokenCount: Int, realTimeFactor: Double, isRefined: Bool)
         case failed(message: String)
     }
 
@@ -24,9 +24,9 @@ extension Array where Element == TranscriptRow {
     ///   `.partial` in place. Late partials arriving after `.final`/`.failed`
     ///   are ignored — final wins.
     /// - `.finalized`: replace in place, or insert at top. Clears any
-    ///   `isPunctuated` flag until a later `.punctuated` arrives.
-    /// - `.punctuated`: replace the row's text, only if the row is `.final`.
-    ///   Marks the row as punctuated so the UI can optionally show a badge.
+    ///   `isRefined` flag until a later `.refined` arrives.
+    /// - `.refined`: replace the row's text, only if the row is `.final`.
+    ///   Marks the row as refined so the UI can optionally show a badge.
     /// - `.failed`: replace in place, or insert at top.
     /// Caller is responsible for the cap (`removeLast(count - maxRows)`).
     mutating func upsert(_ update: TranscriptUpdate) {
@@ -54,7 +54,7 @@ extension Array where Element == TranscriptRow {
         case .finalized(let r):
             let row = TranscriptRow(
                 utteranceID: utteranceID,
-                status: .final(tokenCount: r.tokenCount, realTimeFactor: r.realTimeFactor, isPunctuated: false),
+                status: .final(tokenCount: r.tokenCount, realTimeFactor: r.realTimeFactor, isRefined: false),
                 text: r.text,
                 utteranceDuration: r.utteranceDuration,
                 inferenceDuration: r.inferenceDuration
@@ -65,11 +65,11 @@ extension Array where Element == TranscriptRow {
                 insert(row, at: 0)
             }
 
-        case .punctuated(let p):
+        case .refined(let r):
             guard let idx = existingIndex else { return }
             if case .final(let tokenCount, let rtf, _) = self[idx].status {
-                self[idx].text = p.text
-                self[idx].status = .final(tokenCount: tokenCount, realTimeFactor: rtf, isPunctuated: true)
+                self[idx].text = r.text
+                self[idx].status = .final(tokenCount: tokenCount, realTimeFactor: rtf, isRefined: true)
             }
 
         case .failed(let f):
