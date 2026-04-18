@@ -12,3 +12,7 @@ numpy==1.26.4
 # --no-deps nemo_text_processing` or see Dockerfile for the full recipe.
 pynini==2.1.7
 nemo_text_processing==1.1.0
+# Digit-to-word pre-pass before ITN so ASR-emitted digits ("10 dollars")
+# get normalized to currency symbols. Without this, NeMo ITN's grammar
+# only fires on word-form input and digit-form passes through unchanged.
+num2words==0.5.13

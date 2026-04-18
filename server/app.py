@@ -50,6 +50,7 @@ from fastapi.responses import StreamingResponse
 from nemo_text_processing.inverse_text_normalization.inverse_normalize import (
     InverseNormalizer,
 )
+from num2words import num2words
 from pydantic import BaseModel
 from tokenizers import Tokenizer
 
@@ -236,6 +237,33 @@ def _run_v1_pipeline(text: str) -> str:
     return _apply_casing(joined)
 
 
+# Matches standalone digit runs (optionally a decimal). The `\b` edges
+# keep us from touching digits embedded in URLs, codes, or tokens that
+# happen to contain numbers.
+_BARE_DIGIT_RE = re.compile(r"\b\d+(?:\.\d+)?\b")
+
+
+def _digits_to_words(text: str) -> str:
+    """Convert bare digit runs to their English word form before ITN
+    sees the text. Moonshine emits numeric amounts as digits in many
+    cases ("10 dollars") and NeMo ITN's grammar only triggers on word
+    form ("ten dollars" → "$10") — so without this pre-pass, currency
+    and similar entities don't get normalized for digit-form input.
+
+    Hyphens in `num2words` output ("twenty-seven") are replaced with
+    spaces so the ITN grammar reliably matches number sequences. On any
+    conversion failure (overflow, malformed decimal) the original token
+    passes through unchanged."""
+    def _replace(m: re.Match) -> str:
+        token = m.group(0)
+        try:
+            value = float(token) if "." in token else int(token)
+            return num2words(value).replace("-", " ")
+        except (ValueError, OverflowError):
+            return token
+    return _BARE_DIGIT_RE.sub(_replace, text)
+
+
 # Two WFST artifacts worth fixing in NeMo ITN's output:
 # 1. Spaces before trailing punctuation — "2027 .", "100 %", "word ,".
 #    Reads as broken. Conservative regex: does not touch internal dots
@@ -254,11 +282,16 @@ def _stage_itn(text: str) -> str:
     ("2027", "$10"). Operates on already-punctuated/cased text from
     Stage 2. Graceful fallback — if the WFST raises on a pathological
     input, return the text unchanged rather than failing the whole
-    stream; Stage 2's output is still useful."""
+    stream; Stage 2's output is still useful.
+
+    We pre-pass the input through `_digits_to_words` so ASR-emitted
+    digits ("10 dollars") reach the WFST in the word form it expects.
+    Without this the NeMo ITN grammar would only convert utterances
+    where the ASR happened to spell numbers out."""
     if not text or _itn is None:
         return text
     try:
-        normalized = _itn.inverse_normalize(text, verbose=False)
+        normalized = _itn.inverse_normalize(_digits_to_words(text), verbose=False)
     except Exception:
         log.exception("ITN failed on %r; passing through unchanged", text)
         return text
