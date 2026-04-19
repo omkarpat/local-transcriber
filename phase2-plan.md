@@ -55,10 +55,10 @@
   - Pause auto-scroll if the user scrolls up to re-read earlier text
   - Resume when they return to the bottom; show a "scroll to bottom" button when paused
 - **2.3** Subtle transition animation when a stage lands (e.g., briefly fade the delta, or just let SwiftUI's implicit animation handle the text change). Avoid type-by-type reveals — users perceive those as laggy.
-- **2.4** When paragraph splitting arrives (server emits a new `segmentID` mid-session), render a hard paragraph break in the UI. `Text(AttributedString)` handles this natively with `\n\n` inside the attributed string, or we move to a `VStack` of `Text` per segment. Decide at implementation time — don't over-engineer before the server supports it.
+- **2.4 (DONE)** Server-side paragraph splitting on `new paragraph` plus client-side silence-based reflow shipped. Renderer uses `Text(AttributedString)` with `\n\n` between same-utterance siblings and across utterances flagged `startsNewParagraph` (long silence, stop+restart, session start); single space otherwise. Dictation toggle in the header gates both the server-side split and the spoken-command interpretation.
 - **2.5** Test with rapid dictation: paragraph stays at 60fps even when stage events arrive every ~30–50ms during cloud-refinement bursts.
 
-**Acceptance Criteria**: Merged paragraph renders smoothly as stages land. Auto-scroll feels intuitive. No frame drops during rapid stage updates. Splitting (when shipped) produces clean paragraph breaks without disrupting scroll position.
+**Acceptance Criteria**: Merged paragraph renders smoothly as stages land. Auto-scroll feels intuitive. No frame drops during rapid stage updates. Splitting produces clean paragraph breaks without disrupting scroll position.
 
 ---
 

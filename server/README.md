@@ -74,7 +74,8 @@ curl -sN -X POST http://127.0.0.1:8000/punctuate/stream \
   -H 'X-API-Key: dev-key-change-me' \
   -d '{"text": "send me ten dollars comma by twenty twenty seven",
        "utterance_id": "a1111111-1111-1111-1111-111111111111",
-       "segment_id":   "a1111111-1111-1111-1111-111111111111"}'
+       "segment_id":   "a1111111-1111-1111-1111-111111111111",
+       "dictation_mode": true}'
 # event: stage
 # data: {..., "stage": "commands",  "text": "send me ten dollars, by twenty twenty seven", "final": false}
 #
@@ -84,6 +85,8 @@ curl -sN -X POST http://127.0.0.1:8000/punctuate/stream \
 # event: stage
 # data: {..., "stage": "itn",        "text": "Send me $10, by 2027.",                       "final": true}
 ```
+
+The `dictation_mode` field gates Stage 1 spoken-command interpretation. When `true` (the server default), `comma` / `period` / `new paragraph` etc. are substituted and `new paragraph` splits the utterance into multiple segments — each segment streams its own three stages and only the last segment's `itn` carries `final: true`. When `false`, Stage 1 only strips ASR-supplied punctuation; command words pass through as literal text and the response is always one segment. The iOS client surfaces this as a header toggle (default off) so casual speech about formatting doesn't fragment the transcript. `silence_before_ms` is accepted for forward compatibility but not currently consumed — paragraph-break decisions for cross-utterance silence live on the client.
 
 Then ⌘R in Xcode; the iOS app defaults to `http://127.0.0.1:8000` and
 `X-API-Key: dev-key-change-me`, so no client-side config change needed.

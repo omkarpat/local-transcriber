@@ -377,12 +377,13 @@ try audioSession.setActive(true)
 
 ### Live Transcription View
 
-- **Merged paragraph**: The transcript is a single flowing paragraph, not a list of utterance rows. Finalized utterances concatenate chronologically; the in-flight partial trails at the end in italic. This matches how dictated text reads and leaves room for future paragraph breaks driven by the V2 server.
+- **Reflowing paragraphs**: The transcript reads as flowing prose. Short pauses (under `paragraphSilenceThreshold`, default 2 s) keep the next utterance in the same running paragraph with a single space; longer pauses, an explicit stop+restart, or a spoken `new paragraph` command (when dictation mode is on) start a fresh paragraph. The in-flight partial trails as its own row in italic. This matches how dictated text reads and how speakers naturally signal topic shifts without requiring explicit commands.
 - **Update phases** on each segment:
     1. **Partial** (secondary color, italic): ASR streaming output, may change
     2. **Finalized raw** (primary color): Local ASR result, no punctuation
     3. **Refined** (primary color, overwrites in place): Each cloud pipeline stage progressively improves the segment — commands → punct+case → ITN. With V2 SSE streaming, users see text improve in real time rather than jumping from raw to fully-polished in one update.
-- **Segment identity**: Each refinement is keyed by `segmentID`. In V2 single-segment mode every utterance is its own segment and they all concatenate into one paragraph. When the V2 server starts emitting new segment IDs on spoken "new paragraph" commands (or cross-utterance silence), the UI renders paragraph breaks automatically with no client changes.
+- **Segment identity**: Each row is keyed by `segmentID`. Cross-utterance breaks come from the pipeline's `startsNewParagraph` flag (silence, stop, session start); within-utterance breaks come from the server splitting on a `new paragraph` command and minting a fresh `segmentID` for the next paragraph. The renderer treats both as `\n\n`; rows that don't carry the flag concatenate with a space.
+- **Dictation toggle**: Header button gates Stage 1 spoken-command interpretation. Default off so casual speech captures verbatim; flip on for intentional dictation (`comma` → `,`, `new paragraph` → break, etc.). Toggling mid-session takes effect on the next utterance; in-flight retries replay with the value captured at first dispatch.
 - **Auto-scroll**: Stick to bottom on new text; pause when the user scrolls up to re-read; resume when they return to the bottom. Show a "scroll to bottom" button when paused.
 - **Pause/resume recording**: Single tap to pause, tap again to resume.
 
@@ -462,9 +463,9 @@ See `phase2-plan.md` for the detailed task breakdown.
 
 - [ ] Task 1: Adopt V2 streaming refinement
     - Commit 1 (**DONE**): rename `.punctuated` → `.refined`; introduce `TranscriptRefinement` with `utteranceID` + `segmentID`; merge user-facing view into a single flowing paragraph
-    - Commit 2: server `POST /punctuate/stream` with SSE + deterministic uuidv5 segment IDs + explicit in-flight backpressure / overload handling (tracked in `punctuation-service-v2-plan.md`)
-    - Commit 3: client `PunctuationClient.punctuateStream()` via `URLSession.bytes(for:)`, wire into pipeline
-- [ ] Task 2: Progressive paragraph rendering (auto-scroll, stage transitions, paragraph breaks when server splits)
+    - Commit 2 (**DONE**): server `POST /punctuate/stream` with SSE + deterministic uuidv5 segment IDs (admission control / 429 still pending — see `punctuation-service-v2-plan.md` § Known Follow-ups)
+    - Commit 3 (**DONE**): client `PunctuationClient.punctuateStream()` via `URLSession.bytes(for:)`, wired into pipeline
+- [x] Task 2: Progressive paragraph rendering — server-side `new paragraph` splits, client-side silence-based reflow, dictation toggle in transcription header. Auto-scroll polish still open.
 - [ ] Task 3: SwiftData persistence for sessions
 - [ ] Task 4: `HomeView` with session list
 - [ ] Task 5: Export (.txt, .srt, .vtt, clipboard, share sheet)
@@ -482,8 +483,8 @@ See `punctuation-service-v2-plan.md` for the service-side plan.
 - [ ] Wire the SSE contract in production (start by emitting a single `stage: "full"` event wrapping V1 output — no behaviour change, just contract)
 - [ ] Ship ITN as Stage 3 (NeMo Text Processing); emit dedicated `stage: "itn"` event
 - [ ] Swap XLM-R → NeMo joint DistilBERT for punct+case; A/B on labeled eval set; gate behind flag
-- [ ] Add Stage 1 spoken commands; build labeled eval set for precision/recall tuning
-- [ ] Wire deterministic `silence_before_ms` from client VAD timeline to enable cross-utterance paragraph splits
+- [x] Add Stage 1 spoken commands; build labeled eval set for precision/recall tuning (commands shipped behind `dictation_mode`; eval set still pending)
+- [x] Cross-utterance paragraph splits — implemented client-side using the VAD timeline directly rather than via `silence_before_ms` round-trip. Server's `silence_before_ms` field stays reserved.
 - [ ] Observability: per-stage latency histograms, p50/p95/p99/p999 tracked separately, plus in-flight request count, overload rejects, disconnects, and fallback rate
 
 **Exit criteria**: All three stages in production behind flags with documented quality wins on labeled eval. p99 < 250ms for 30–60 token inputs. No regression on V1 punctuation F1.

@@ -16,7 +16,7 @@ Out of scope (deferred):
 
 **Important framing:** V2 fixes *formatting* problems (missing punctuation, wrong casing, "twenty twenty six" instead of "2026"). It does *not* fix ASR recognition errors (homophones like "405" → "four or five", out-of-vocabulary terms, world-knowledge confusions). Those need to be solved at the ASR layer or with an LLM — see "What V2 Cannot Fix" below.
 
-**Stateless posture (decided this session):** The server stays a pure function of its request. No session state, no conversation history, no rolling context. Paragraph-break decisions that need cross-utterance signals (e.g., long silence) are handled by having the **client supply the signal in the request** (`silence_before_ms`), not by the server maintaining memory. See "Paragraph Breaks & Segment IDs" below.
+**Stateless posture:** The server stays a pure function of its request. No session state, no conversation history, no rolling context. Cross-utterance paragraph-break decisions (long silence, stop+restart) are made entirely on the client — the server never even sees them. The `silence_before_ms` field stays in the request schema as reserved/unused; the client could repurpose it later if a server-side heuristic ever justifies the round trip, but as shipped the decision is local. See "Paragraph Breaks & Segment IDs" below.
 
 ## Pipeline Architecture (V2)
 
@@ -61,9 +61,12 @@ Body: {
   "text": "...",
   "utterance_id": "abc-123",
   "segment_id": "aaa-111",         // client's current running segment id
-  "silence_before_ms": 2400        // optional; client-supplied signal for paragraph-break heuristics
+  "silence_before_ms": 2400,       // optional, reserved; not currently consumed by the server
+  "dictation_mode": true           // when false, Stage 1 skips spoken-command interpretation
 }
 ```
+
+`dictation_mode` defaults to `true` server-side so existing callers keep current behavior. When set false, Stage 1 short-circuits to `[strip_asr_punctuation(text)]` — ASR punctuation is still cleaned for Stage 2's model, but spoken commands (`comma`, `period`, `new paragraph`, ...) pass through as literal text and within-utterance paragraph splitting does not happen. The iOS client exposes a header toggle for this; default off so casual speech about formatting (e.g. "can you add a new paragraph") doesn't fragment.
 
 Response is `text/event-stream`. Each event is `event: stage` with a JSON `data:` payload:
 
@@ -117,14 +120,17 @@ When a stream fails and the client's retry queue replays the utterance, the serv
 
 Rule: any new segment id the server mints is `uuidv5(namespace=utterance_id, name=str(split_index))`. Reproducible across retries with zero server state.
 
-### Client-supplied paragraph-break signals
+### Client-side paragraph-break decisions
 
-The server never decides paragraph breaks on "long silence between utterances" because it doesn't see them. The client has the VAD timeline and supplies a `silence_before_ms` field. Stage 1 uses it as a secondary heuristic:
+As shipped, the server makes one paragraph-break decision: explicit `new paragraph` commands inside an utterance's text (Stage 1, dictation mode only). Every other break is decided on the client where the VAD timeline lives:
 
-- Silence > threshold (e.g., 2s) → insert a paragraph break at the start of this utterance (mints a new segment id).
-- Explicit "new paragraph" command → insert a paragraph break at that point within the utterance.
+- Silence > `paragraphSilenceThreshold` (default 2 s, configurable on `PipelineConfiguration`) → next utterance is rendered as a new paragraph.
+- Stop-recording event → next utterance after restart is rendered as a new paragraph, regardless of pause length. Treated as an explicit user gesture.
+- First utterance of a session has no prior context, so it does not get a leading paragraph break.
 
-Both are local decisions — the request carries everything the server needs. The server stays a pure function of `(text, utterance_id, segment_id, silence_before_ms)`.
+The pipeline stamps `startsNewParagraph` on the partial/finalized update for the affected utterance; the iOS renderer turns that flag (plus a within-utterance-sibling check for server-side `new paragraph` splits) into `\n\n` separators. The server is unaware of any of this — it never reads `silence_before_ms` and has no concept of "running paragraph." The field stays in the request schema as reserved so a future server-side use case wouldn't be a wire change.
+
+**Why client-side rather than server-side:** keeping the decision local avoids a roundtrip's worth of latency on a pure rendering choice and means the user can change the threshold (or the algorithm entirely) without touching the server. The original design contemplated a server-side heuristic driven by `silence_before_ms`; in practice the client already has all the inputs and a richer view of the user's intent (stop button, threshold setting, future per-app rules), so the server has nothing extra to contribute.
 
 ### Why the server never carries state
 
@@ -144,7 +150,7 @@ struct TranscriptRefinement {
 }
 ```
 
-UI upserts by `segmentID`: one paragraph per unique id. Today every utterance → one segment → one paragraph that grows with the session. When splitting ships, one utterance can emit multiple segment ids and the paragraph count grows naturally.
+UI upserts by `segmentID`. Within-utterance siblings (server-side `new paragraph` splits) always render as separate paragraphs — they share `utteranceID` so the renderer treats them as forced breaks. Cross-utterance breaks are decided by the pipeline's `startsNewParagraph` flag (silence threshold, stop-recording, session start). Short pauses without that flag flow into the same running paragraph with a single space.
 
 ---
 
