@@ -256,42 +256,39 @@ struct TranscriptionView: View {
         }
     }
 
-    /// Renders all rows as a single flowing paragraph. Finalized utterances
-    /// (raw or refined) concatenate in chronological order; the in-flight
-    /// `.partial`, if any, trails at the end in italic/secondary so the
-    /// user can see what's being transcribed right now. Failures get a
-    /// small red marker so they don't silently disappear from the flow.
+    /// Renders all rows as a flowing transcript, one paragraph per row.
+    /// Every row — whether a split-sibling within an utterance or the
+    /// first segment of a new utterance — gets a `\n\n` break. The
+    /// in-flight `.partial`, if any, trails as its own paragraph in
+    /// italic/secondary so the user can see what's being transcribed
+    /// right now. Failures get a small red marker.
     ///
     /// `model.rows` is newest-first (upsert inserts at index 0), so we
-    /// reverse for display. Until V2 splitting lands, everything in one
-    /// session is one segment, hence one paragraph.
+    /// reverse for display.
     private var paragraph: AttributedString {
         var result = AttributedString("")
         for row in model.rows.reversed() {
+            let content: AttributedString?
             switch row.status {
             case .partial:
-                appendSpaceIfNeeded(&result)
                 var partial = AttributedString(row.text.isEmpty ? "…" : row.text + " …")
                 partial.foregroundColor = .secondary
                 partial.inlinePresentationIntent = .emphasized
-                result.append(partial)
+                content = partial
             case .final:
-                guard !row.text.isEmpty else { continue }
-                appendSpaceIfNeeded(&result)
-                result.append(AttributedString(row.text))
+                content = row.text.isEmpty ? nil : AttributedString(row.text)
             case .failed:
-                appendSpaceIfNeeded(&result)
                 var marker = AttributedString("⚠︎")
                 marker.foregroundColor = .red
-                result.append(marker)
+                content = marker
             }
+            guard let content else { continue }
+            if !result.characters.isEmpty {
+                result.append(AttributedString("\n\n"))
+            }
+            result.append(content)
         }
         return result
-    }
-
-    private func appendSpaceIfNeeded(_ s: inout AttributedString) {
-        guard !s.characters.isEmpty else { return }
-        s.append(AttributedString(" "))
     }
 
     private var emptyState: some View {
