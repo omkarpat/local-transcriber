@@ -40,6 +40,7 @@ nonisolated final class PunctuationClient: @unchecked Sendable {
         utteranceID: UUID,
         segmentID: UUID,
         text: String,
+        dictationMode: Bool,
         silenceBeforeMs: Int? = nil
     ) -> AsyncStream<PunctuationStageEvent> {
         AsyncStream { continuation in
@@ -62,7 +63,8 @@ nonisolated final class PunctuationClient: @unchecked Sendable {
                         text: text,
                         utteranceId: utteranceID,
                         segmentId: segmentID,
-                        silenceBeforeMs: silenceBeforeMs
+                        silenceBeforeMs: silenceBeforeMs,
+                        dictationMode: dictationMode
                     ))
                 } catch {
                     log.error("stream encode failed: \(String(describing: error), privacy: .public)")
@@ -237,11 +239,13 @@ private nonisolated struct StreamRequest: Encodable {
     let utteranceId: UUID
     let segmentId: UUID
     let silenceBeforeMs: Int?
+    let dictationMode: Bool
 
     enum CodingKeys: String, CodingKey {
         case text
         case utteranceId = "utterance_id"
         case segmentId = "segment_id"
         case silenceBeforeMs = "silence_before_ms"
+        case dictationMode = "dictation_mode"
     }
 }

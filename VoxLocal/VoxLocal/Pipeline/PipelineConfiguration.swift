@@ -20,5 +20,25 @@ nonisolated struct PipelineConfiguration: Sendable, Equatable {
     /// disabled. Off by default.
     var debugDumpUtterances: Bool = false
 
+    /// Silence between an utterance ending and the next utterance starting
+    /// at or above this value forces the next utterance to begin a new
+    /// paragraph. Below it, the next utterance flows into the running
+    /// paragraph with a single space separator. The first utterance of a
+    /// session and the first utterance after a stop+restart also start
+    /// a new paragraph regardless of this threshold. Set to `.zero` to
+    /// disable silence-based breaks (only `new paragraph` and stop will
+    /// then break).
+    var paragraphSilenceThreshold: Duration = .seconds(2)
+
+    /// When true, the server interprets spoken commands ("comma" → ",",
+    /// "new paragraph" → segment break, etc.) and the client respects
+    /// server-emitted multi-segment splits. When false, spoken commands
+    /// pass through as literal text and within-utterance splits don't
+    /// happen. Off by default — a conservative posture so casual speech
+    /// like "can you add a new paragraph" is captured verbatim. The
+    /// transcription header exposes a toggle for users who want
+    /// dictation behavior.
+    var dictationMode: Bool = false
+
     static let `default` = PipelineConfiguration()
 }

@@ -122,6 +122,41 @@ class TestNoLeaks:
         assert forbidden_fragment not in out["stage3"].lower()
 
 
+class TestParagraphSplitting:
+    """`new paragraph` splits the utterance into multiple segments.
+    Each segment runs the full pipeline independently, so each gets
+    its own casing + ITN pass."""
+
+    def test_two_paragraphs_produce_two_segments(self, pipeline) -> None:
+        out = pipeline("hello world new paragraph how are you")
+        assert len(out["stage3_segs"]) == 2
+
+    def test_each_segment_independently_cased(self, pipeline) -> None:
+        # Each paragraph starts its own sentence → each should begin
+        # capitalized after Stage 2's casing pass.
+        out = pipeline("hello new paragraph world")
+        assert out["stage3_segs"][0][0].isupper()
+        assert out["stage3_segs"][1][0].isupper()
+
+    def test_punct_before_split_preserved(self, pipeline) -> None:
+        # "comma" glues to paragraph 1's last word; paragraph 2 starts
+        # clean. Both segments reach Stage 3 independently.
+        out = pipeline("hello comma everyone new paragraph see you later")
+        assert "," in out["stage3_segs"][0]
+        assert "," not in out["stage3_segs"][1]
+
+    def test_itn_runs_per_segment(self, pipeline) -> None:
+        # Numbers in either paragraph should get normalized in their
+        # own Stage 3 pass.
+        out = pipeline(
+            "i owe you twenty dollars period new paragraph "
+            "see me in twenty twenty seven"
+        )
+        assert len(out["stage3_segs"]) == 2
+        assert "$20" in out["stage3_segs"][0]
+        assert "2027" in out["stage3_segs"][1]
+
+
 class TestRegressionSnapshots:
     """Exact-match snapshots on representative inputs. Pin these so any
     change to the pipeline (model swap, stage reorder, ITN tweak) that

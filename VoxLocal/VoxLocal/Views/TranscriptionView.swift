@@ -29,6 +29,19 @@ final class TranscriptionModel {
     /// escape hatch if someone wants to isolate finalized-only behavior).
     var partialIntervalMs: Int? = 1500
 
+    /// Header toggle controlling whether the server interprets spoken
+    /// commands ("comma", "period", "new paragraph"). The pipeline owns
+    /// the authoritative value; this property mirrors it for SwiftUI
+    /// binding. Setting from the UI fans out to the pipeline so the
+    /// next utterance picks up the new mode. Default off — see
+    /// `PipelineConfiguration.dictationMode` for rationale.
+    var dictationMode: Bool = false {
+        didSet {
+            guard oldValue != dictationMode, let pipeline else { return }
+            Task { await pipeline.setDictationMode(self.dictationMode) }
+        }
+    }
+
     /// Max rows retained in the scroll view. Older utterances drop off the
     /// bottom; the user can still read them via the debug view's larger
     /// history if they care. 40 comfortably covers a typical session.
@@ -62,6 +75,7 @@ final class TranscriptionModel {
         errorMessage = nil
         var config = PipelineConfiguration.default
         config.vad.partialTranscriptionInterval = partialIntervalMs.map { .milliseconds($0) }
+        config.dictationMode = dictationMode
         do {
             try await pipeline.start(configuration: config)
             sessionStart = Date()
@@ -237,6 +251,21 @@ struct TranscriptionView: View {
                 .frame(height: 10)
 
             SpeakingIndicator(isSpeaking: model.isSpeaking, isRunning: model.isRunning)
+
+            // Dictation toggle. Tappable while recording — the pipeline
+            // accepts mid-session changes and applies them to the next
+            // utterance dispatched. Color shift makes the active state
+            // legible at a glance during a session.
+            Button {
+                model.dictationMode.toggle()
+            } label: {
+                Label("Dictation", systemImage: model.dictationMode ? "text.cursor" : "text.bubble")
+                    .labelStyle(.iconOnly)
+                    .font(.title3)
+                    .foregroundStyle(model.dictationMode ? Color.accentColor : .secondary)
+            }
+            .accessibilityLabel(model.dictationMode ? "Dictation mode on" : "Dictation mode off")
+            .accessibilityHint("Toggles whether spoken commands like \"comma\" or \"new paragraph\" are interpreted.")
         }
     }
 
@@ -256,42 +285,54 @@ struct TranscriptionView: View {
         }
     }
 
-    /// Renders all rows as a single flowing paragraph. Finalized utterances
-    /// (raw or refined) concatenate in chronological order; the in-flight
-    /// `.partial`, if any, trails at the end in italic/secondary so the
-    /// user can see what's being transcribed right now. Failures get a
-    /// small red marker so they don't silently disappear from the flow.
+    /// Renders all rows as a flowing transcript. The separator between
+    /// consecutive rendered rows depends on grouping:
+    ///
+    /// - Same `utteranceID` (server-side `new paragraph` siblings): always
+    ///   `\n\n` — the user explicitly asked for a break inside this
+    ///   utterance.
+    /// - Different `utteranceID`, `startsNewParagraph == true`: `\n\n`.
+    ///   The pipeline marked this utterance as a paragraph break (long
+    ///   silence, stop+restart, or session start).
+    /// - Different `utteranceID`, `startsNewParagraph == false`: a single
+    ///   space. The utterance flows into the running paragraph; a brief
+    ///   VAD-closed pause within continuous dictation reads as one
+    ///   thought.
+    ///
+    /// Partials render as their own row in the appropriate paragraph
+    /// slot — italic/secondary so the user sees what's being
+    /// transcribed right now. Failures get a small red marker that
+    /// inherits the paragraph flow of the row it replaces.
     ///
     /// `model.rows` is newest-first (upsert inserts at index 0), so we
-    /// reverse for display. Until V2 splitting lands, everything in one
-    /// session is one segment, hence one paragraph.
+    /// reverse for display.
     private var paragraph: AttributedString {
         var result = AttributedString("")
+        var previousRow: TranscriptRow? = nil
         for row in model.rows.reversed() {
+            let content: AttributedString?
             switch row.status {
             case .partial:
-                appendSpaceIfNeeded(&result)
                 var partial = AttributedString(row.text.isEmpty ? "…" : row.text + " …")
                 partial.foregroundColor = .secondary
                 partial.inlinePresentationIntent = .emphasized
-                result.append(partial)
+                content = partial
             case .final:
-                guard !row.text.isEmpty else { continue }
-                appendSpaceIfNeeded(&result)
-                result.append(AttributedString(row.text))
+                content = row.text.isEmpty ? nil : AttributedString(row.text)
             case .failed:
-                appendSpaceIfNeeded(&result)
                 var marker = AttributedString("⚠︎")
                 marker.foregroundColor = .red
-                result.append(marker)
+                content = marker
             }
+            guard let content else { continue }
+            if let prev = previousRow {
+                let breakHere = prev.utteranceID == row.utteranceID || row.startsNewParagraph
+                result.append(AttributedString(breakHere ? "\n\n" : " "))
+            }
+            result.append(content)
+            previousRow = row
         }
         return result
-    }
-
-    private func appendSpaceIfNeeded(_ s: inout AttributedString) {
-        guard !s.characters.isEmpty else { return }
-        s.append(AttributedString(" "))
     }
 
     private var emptyState: some View {

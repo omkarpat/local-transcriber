@@ -652,6 +652,36 @@ blocking for the current work item.
   touching the active stream. Bounded impact today (worst case 60 s),
   so only do this if the latency shows up in practice.
 
+- **Multi-segment first-try drops.** Observed during paragraph-split
+  testing: every multi-segment utterance's first-try stream timed out
+  on the client (`NSURLErrorDomain -1001`) after Stage 1 events landed
+  but before the server reached Stage 2. Retry then replayed and
+  completed in ~500 ms with identical segment ids (uuidv5 determinism
+  works as designed, so no UI orphan rows). Single-segment utterances
+  are unaffected. Server logs show no error, so the suspicion is
+  client-side: either the 4 s `timeoutIntervalForRequest` interacts
+  badly with `URLSession.AsyncBytes.lines` when several `commands`
+  events arrive back-to-back before any `punct_case` event, or the
+  duplicate-dispatch issue above is doubling server CPU into the
+  timeout. Investigate after the duplicate-dispatch fix lands; if the
+  drops persist, raise the per-request timeout to ~8 s and bump
+  `timeoutIntervalForResource` accordingly.
+
+- **Comma-between-spelled-numbers guard before ITN.** NeMo's ITN
+  greedily matches adjacent number-words against the time-of-day
+  grammar (`"nine ten"` → `"09:10"`). Stage 2's punct_case model
+  reliably inserts the comma between consecutive list items on short
+  inputs but occasionally drops one on long repetitive runs (per-token
+  argmax confidence drifts on repeating context). Result: `"...eight,
+  nine ten."` from Stage 2 becomes `"...eight, 09:10."` after Stage 3
+  even though the user clearly counted to ten. Fix is a tiny regex
+  pre-pass between Stage 2 and Stage 3 that inserts a comma between
+  any `\b(one|two|...|ten)\s+(one|two|...|ten)\b` pair before the
+  WFST sees the text. Deterministic, microseconds, narrow. Worth
+  keeping even after a punctuation model upgrade since
+  token-classification models will always have some non-zero miss
+  rate on long lists.
+
 ## Out of Scope (Explicit)
 
 These are *not* in V2 — punt to V3 conversation:
