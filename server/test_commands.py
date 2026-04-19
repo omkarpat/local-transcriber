@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import pytest
 
+from app import _run_stage1
 from commands import (
     apply_spoken_commands,
     strip_asr_punctuation,
@@ -162,6 +163,37 @@ class TestEdgeCases:
     def test_command_at_utterance_start(self) -> None:
         # Leading command gets prepended standalone (rare edge case).
         assert apply_spoken_commands("comma then continue") == [", then continue"]
+
+
+class TestDictationModeOff:
+    """`_run_stage1(text, dictation_mode=False)` is what the streaming
+    endpoint uses for conversational-mode requests. Spoken commands
+    must pass through as literal words; ASR-supplied punctuation is
+    still stripped so Stage 2's model gets the input format it expects."""
+
+    def test_comma_word_survives(self) -> None:
+        # "comma" is interpreted as a command in dictation mode but
+        # must remain literal here.
+        assert _run_stage1("hello comma how are you", dictation_mode=False) == [
+            "hello comma how are you"
+        ]
+
+    def test_new_paragraph_does_not_split(self) -> None:
+        assert _run_stage1("can you add a new paragraph here", dictation_mode=False) == [
+            "can you add a new paragraph here"
+        ]
+
+    def test_asr_punctuation_still_stripped(self) -> None:
+        # Stage 2 needs the input free of ASR-supplied marks regardless
+        # of mode; only the command-interpretation pass is gated.
+        assert _run_stage1("Hello, world.", dictation_mode=False) == ["Hello world"]
+
+    def test_dictation_on_still_substitutes(self) -> None:
+        # Sanity check the helper routes correctly; equivalent to the
+        # default `apply_spoken_commands` path for the same input.
+        assert _run_stage1("hello comma how are you", dictation_mode=True) == [
+            "hello, how are you"
+        ]
 
 
 class TestNewParagraphSplitting:

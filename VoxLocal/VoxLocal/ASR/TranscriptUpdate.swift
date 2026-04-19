@@ -55,6 +55,13 @@ nonisolated struct TranscriptResult: Sendable, Identifiable, Equatable {
     let inferenceDuration: Duration    // wall clock: model + tokenizer
     let tokenCount: Int
     let timings: TranscriptionTimings  // stage-by-stage breakdown from MoonshineModel
+    /// Set by `TranscriptionPipeline` when this utterance should begin a
+    /// new visual paragraph (long silence before its start, an immediately
+    /// preceding stop+restart, or session beginning after a clear). The
+    /// transcriber leaves it at the default; pipeline mutates the value
+    /// before forwarding to consumers. Pure rendering hint — no effect on
+    /// upsert keys, refinement, or retry behavior.
+    var startsNewParagraph: Bool = false
 
     static func == (lhs: TranscriptResult, rhs: TranscriptResult) -> Bool {
         lhs.id == rhs.id && lhs.text == rhs.text && lhs.tokenCount == rhs.tokenCount
@@ -83,6 +90,10 @@ nonisolated struct TranscriptPartial: Sendable, Identifiable, Equatable {
     let text: String
     let utteranceDuration: Duration    // audio length at the tick that produced this partial
     let inferenceDuration: Duration
+    /// See `TranscriptResult.startsNewParagraph` — same semantics; tracked
+    /// from the partial so the UI can render the running partial in its
+    /// final paragraph slot before `.finalized` lands.
+    var startsNewParagraph: Bool = false
 }
 
 nonisolated struct TranscriptFailure: Sendable, Identifiable, Equatable {

@@ -67,6 +67,27 @@ actor TranscriptionPipeline {
     /// success (drained > 0) resets the counter.
     private let maxConsecutiveNoProgress = 5
 
+    /// Wall-clock instant of the most recent `utteranceEnded` event for
+    /// the current session. Reset to `nil` on `start()` and on `stop()`
+    /// so silence detection treats a stop+restart as "no prior context"
+    /// and forces a paragraph break for the first utterance after.
+    private var lastUtteranceEndTime: ContinuousClock.Instant?
+
+    /// One-shot flag that forces the next utterance to begin a new
+    /// paragraph regardless of measured silence. Set on `stop()` so the
+    /// user's "stop recording" gesture is treated as a paragraph break
+    /// even when they immediately resume. Consumed (and reset) by the
+    /// next `utteranceStarted` event.
+    private var nextUtteranceStartsParagraph: Bool = false
+
+    /// Utterance IDs whose first segment row should render as a new
+    /// visual paragraph. Populated at `utteranceStarted` time based on
+    /// silence and stop-flag state; consumed by the update-forwarding
+    /// task as it enriches partial/finalized events. Bounded growth —
+    /// entries are removed once the corresponding `.finalized` is
+    /// forwarded (or on `start()` reset).
+    private var paragraphBreakUtteranceIDs: Set<UUID> = []
+
     private struct PendingPunctuation: Sendable {
         let utteranceID: UUID
         /// The `segmentID` that was current when this utterance was first
@@ -79,6 +100,11 @@ actor TranscriptionPipeline {
         let segmentIDAtDispatch: UUID
         let text: String
         let utteranceDuration: Duration
+        /// Captured at first-try dispatch so retries replay with the
+        /// same Stage 1 mode the user had selected at the time the
+        /// utterance was spoken. Toggling dictation mid-session must
+        /// not retroactively reinterpret already-recorded utterances.
+        let dictationModeAtDispatch: Bool
     }
 
     init(
@@ -134,6 +160,21 @@ actor TranscriptionPipeline {
     /// outages and drains back to zero once the server is reachable.
     var pendingPunctuationCount: Int { pendingPunctuation.count }
 
+    /// Live read of the current dictation toggle. Reflects whatever the
+    /// most recent `setDictationMode(_:)` call set; safe to read between
+    /// recordings to surface the current state in the UI.
+    var dictationMode: Bool { configuration.dictationMode }
+
+    /// Update the dictation toggle mid-session. Takes effect for the
+    /// next utterance that finishes after the call lands; in-flight
+    /// dispatches and queued retries replay with the value captured at
+    /// their original dispatch time, so toggling the UI doesn't
+    /// retroactively reinterpret already-spoken utterances.
+    func setDictationMode(_ enabled: Bool) {
+        configuration.dictationMode = enabled
+        log.info("dictation mode \(enabled ? "enabled" : "disabled", privacy: .public)")
+    }
+
     /// Start a fresh session. Idempotent — already-running is a no-op.
     /// Throws on audio/permission failure; VAD errors surface later on
     /// `events` as `.failed(String)`.
@@ -146,6 +187,15 @@ actor TranscriptionPipeline {
             log.error("audio start failed: \(String(describing: error), privacy: .public)")
             throw error
         }
+
+        // Reset paragraph-break state for the fresh session. Carrying
+        // over from the previous session would either force a redundant
+        // break (stop-flag still set) or compute silence against a stale
+        // end time. Either way, fresh state matches the user's mental
+        // model of "I just hit record."
+        lastUtteranceEndTime = nil
+        nextUtteranceStartsParagraph = false
+        paragraphBreakUtteranceIDs.removeAll()
 
         let vad = VADProcessor(ringBuffer: manager.ringBuffer, configuration: configuration.vad)
         self.vad = vad
@@ -175,6 +225,16 @@ actor TranscriptionPipeline {
         // session, those utterances should still get refined when the
         // server recovers — the drain loop has its own termination
         // condition (see `drainLoop`) so it can't run forever.
+
+        // The user's stop gesture is itself a paragraph-break signal: if
+        // they hit record again, that next utterance should start a
+        // fresh paragraph regardless of how brief the gap was. Reset
+        // `lastUtteranceEndTime` too so silence comparisons after the
+        // restart compute against the actual recording window, not the
+        // stale gap that includes the stop+restart latency.
+        nextUtteranceStartsParagraph = true
+        lastUtteranceEndTime = nil
+
         running = false
         eventsContinuation.yield(.stopped)
         log.info("pipeline stopped")
@@ -198,11 +258,34 @@ actor TranscriptionPipeline {
         case .frame(let probability, let isSpeech):
             debugContinuation?.yield(.frame(probability: probability, isSpeech: isSpeech))
         case .utteranceStarted(let id):
+            // Decide right now whether this utterance should begin a new
+            // visual paragraph. We mark it iff the stop-recording flag
+            // is set OR the silence since the prior utterance ended
+            // crossed the configured threshold. The first utterance of
+            // a session has no prior end time and no stop flag, so it
+            // does NOT get marked — it's the first content; there's
+            // nothing to break from.
+            let now = ContinuousClock.now
+            let breakFromSilence: Bool
+            if let lastEnd = lastUtteranceEndTime {
+                breakFromSilence = (now - lastEnd) >= configuration.paragraphSilenceThreshold
+            } else {
+                breakFromSilence = false
+            }
+            if nextUtteranceStartsParagraph || breakFromSilence {
+                paragraphBreakUtteranceIDs.insert(id)
+            }
+            nextUtteranceStartsParagraph = false
             debugContinuation?.yield(.utteranceStarted(utteranceID: id))
             eventsContinuation.yield(.speechStateChanged(isActive: true))
         case .utteranceProgress(let id, let samples, let duration):
             transcriber.enqueuePartial(utteranceID: id, samples: samples, duration: duration)
         case .utteranceEnded(let id, let samples, let duration):
+            // Record the end time so the *next* utteranceStarted can
+            // measure the silence gap. Stamped synchronously here so it
+            // reflects when the VAD event arrived, not when downstream
+            // ASR work completes.
+            lastUtteranceEndTime = ContinuousClock.now
             debugContinuation?.yield(.utteranceEnded(utteranceID: id, duration: duration))
             eventsContinuation.yield(.speechStateChanged(isActive: false))
             if configuration.debugDumpUtterances {
@@ -230,17 +313,50 @@ actor TranscriptionPipeline {
     /// fire cloud-punctuation requests in parallel for finalized results.
     /// Survives across start/stop because the transcriber is long-lived;
     /// we only (re)install it on first start.
+    ///
+    /// Each partial/finalized is enriched with `startsNewParagraph` based
+    /// on the per-utterance decision we made at `utteranceStarted` time.
+    /// Once the `.finalized` event has been forwarded the entry is
+    /// removed from `paragraphBreakUtteranceIDs` so the set doesn't
+    /// grow without bound across long sessions. Refined and failed
+    /// updates pass through untouched — the row already carries the
+    /// flag from its initial insert.
     private func startTranscriptForwarding() {
         guard transcriptForwardTask == nil else { return }
         let updatesContinuation = self.updatesContinuation
         let transcriberUpdates = transcriber.updates
         transcriptForwardTask = Task { [weak self] in
             for await update in transcriberUpdates {
-                updatesContinuation.yield(update)
-                guard case .finalized(let result) = update else { continue }
-                guard let self, await self.configuration.enableCloudPunctuation else { continue }
+                guard let self else {
+                    updatesContinuation.yield(update)
+                    continue
+                }
+                let enriched = await self.enrichingParagraphFlag(update)
+                updatesContinuation.yield(enriched)
+                guard case .finalized(let result) = enriched else { continue }
+                guard await self.configuration.enableCloudPunctuation else { continue }
                 await self.dispatchFirstTryPunctuation(for: result)
             }
+        }
+    }
+
+    /// Look up the paragraph-break decision for this update's utterance
+    /// and stamp it onto partial/finalized payloads. Finalized
+    /// consumes the entry — partials may keep arriving for the same
+    /// utterance, but once finalized has been forwarded the per-utterance
+    /// decision has done its job and the entry can be released.
+    private func enrichingParagraphFlag(_ update: TranscriptUpdate) -> TranscriptUpdate {
+        let breaks = paragraphBreakUtteranceIDs.contains(update.utteranceID)
+        switch update {
+        case .partial(var p):
+            p.startsNewParagraph = breaks
+            return .partial(p)
+        case .finalized(var r):
+            r.startsNewParagraph = breaks
+            paragraphBreakUtteranceIDs.remove(update.utteranceID)
+            return .finalized(r)
+        case .refined, .failed:
+            return update
         }
     }
 
@@ -257,6 +373,11 @@ actor TranscriptionPipeline {
         // naming reminds readers this is frozen at first-try time and
         // must be reused verbatim on retry.
         let dispatchSegmentID = result.utteranceID
+        // Capture the dictation toggle as it stood when the user finished
+        // speaking. Toggling mid-session must not retroactively flip
+        // already-recorded utterances between command-interpreted and
+        // literal — the retry queue replays this same value.
+        let dispatchDictationMode = configuration.dictationMode
 
         Task.detached { [weak self] in
             guard let self else { return }
@@ -264,14 +385,16 @@ actor TranscriptionPipeline {
                 utteranceID: result.utteranceID,
                 segmentID: dispatchSegmentID,
                 text: result.text,
-                utteranceDuration: result.utteranceDuration
+                utteranceDuration: result.utteranceDuration,
+                dictationMode: dispatchDictationMode
             )
             if !succeeded {
                 await self.enqueueForRetry(
                     utteranceID: result.utteranceID,
                     segmentIDAtDispatch: dispatchSegmentID,
                     text: result.text,
-                    utteranceDuration: result.utteranceDuration
+                    utteranceDuration: result.utteranceDuration,
+                    dictationMode: dispatchDictationMode
                 )
             }
         }
@@ -288,14 +411,16 @@ actor TranscriptionPipeline {
         utteranceID: UUID,
         segmentID: UUID,
         text: String,
-        utteranceDuration: Duration
+        utteranceDuration: Duration,
+        dictationMode: Bool
     ) async -> Bool {
         let start = ContinuousClock.now
         var sawFinal = false
         for await event in punctuationClient.punctuateStream(
             utteranceID: utteranceID,
             segmentID: segmentID,
-            text: text
+            text: text,
+            dictationMode: dictationMode
         ) {
             let elapsed = ContinuousClock.now - start
             let refinement = TranscriptRefinement(
@@ -350,14 +475,16 @@ actor TranscriptionPipeline {
         utteranceID: UUID,
         segmentIDAtDispatch: UUID,
         text: String,
-        utteranceDuration: Duration
+        utteranceDuration: Duration,
+        dictationMode: Bool
     ) {
         if pendingPunctuation.contains(where: { $0.utteranceID == utteranceID }) { return }
         pendingPunctuation.append(PendingPunctuation(
             utteranceID: utteranceID,
             segmentIDAtDispatch: segmentIDAtDispatch,
             text: text,
-            utteranceDuration: utteranceDuration
+            utteranceDuration: utteranceDuration,
+            dictationModeAtDispatch: dictationMode
         ))
         if pendingPunctuation.count > maxPendingPunctuation {
             let drop = pendingPunctuation.count - maxPendingPunctuation
@@ -436,7 +563,8 @@ actor TranscriptionPipeline {
                 utteranceID: next.utteranceID,
                 segmentID: next.segmentIDAtDispatch,
                 text: next.text,
-                utteranceDuration: next.utteranceDuration
+                utteranceDuration: next.utteranceDuration,
+                dictationMode: next.dictationModeAtDispatch
             )
             guard succeeded else { break }
             // Guard against the queue being mutated during the stream's

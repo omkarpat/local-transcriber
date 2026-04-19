@@ -55,7 +55,7 @@ from num2words import num2words
 from pydantic import BaseModel
 from tokenizers import Tokenizer
 
-from commands import apply_spoken_commands
+from commands import apply_spoken_commands, strip_asr_punctuation
 
 # ---------- Config (env vars) ------------------------------------------------
 
@@ -198,11 +198,17 @@ class PunctuateStreamRequest(BaseModel):
     running rendering segment; the server echoes it back on every stage
     event. `silence_before_ms` is an optional client-supplied VAD-derived
     signal; reserved for Stage 1 paragraph-break heuristics, accepted but
-    not yet used."""
+    not yet used. `dictation_mode` controls Stage 1's spoken-command
+    interpretation: when False, command words ("comma", "period", "new
+    paragraph") pass through as literal text — useful when the client is
+    capturing conversational speech rather than dictation. Default True
+    so existing callers keep current behavior; conservative client UIs
+    typically default the toggle to off."""
     text: str
     utterance_id: str
     segment_id: str
     silence_before_ms: int | None = None
+    dictation_mode: bool = True
 
 
 def _require_api_key(x_api_key: str = Header(..., alias="X-API-Key")) -> None:
@@ -313,6 +319,19 @@ def _sse(event: str, payload: dict) -> bytes:
     return f"event: {event}\ndata: {json.dumps(payload)}\n\n".encode()
 
 
+def _run_stage1(text: str, dictation_mode: bool) -> list[str]:
+    """Stage 1 entry point shared by the streaming endpoint and tests.
+    ASR punctuation strip is unconditional — Stage 2's model is trained
+    on lowercased, unpunctuated input, so any ASR-emitted marks would
+    put it out of distribution. Spoken-command substitution and
+    paragraph splitting only run in dictation mode; in conversational
+    mode `comma`/`period`/`new paragraph` land as literal words rather
+    than being interpreted as formatting."""
+    if dictation_mode:
+        return apply_spoken_commands(text)
+    return [strip_asr_punctuation(text)]
+
+
 def _mint_segment_ids(utterance_id: str, incoming_segment_id: str, n: int) -> list[str]:
     """Deterministic segment ids for an n-paragraph split. Paragraph 0
     reuses the client's `incoming_segment_id` so its stage events
@@ -379,11 +398,7 @@ async def punctuate_stream(
 
     async def gen():
         try:
-            # Stage 1: spoken punctuation commands + ASR punct strip +
-            # paragraph splitting. Pure string ops, sub-millisecond —
-            # `to_thread` is overkill but keeps the yield-between-stages
-            # pattern uniform. Returns a list of one or more paragraphs.
-            paragraphs = await asyncio.to_thread(apply_spoken_commands, req.text)
+            paragraphs = await asyncio.to_thread(_run_stage1, req.text, req.dictation_mode)
             segment_ids = _mint_segment_ids(
                 req.utterance_id, req.segment_id, len(paragraphs)
             )

@@ -20,6 +20,13 @@ struct TranscriptRow: Identifiable, Equatable {
     var text: String
     var utteranceDuration: Duration
     var inferenceDuration: Duration
+    /// True iff this row should begin a new visual paragraph rather than
+    /// continuing the prior row's paragraph. Set when the row is first
+    /// inserted (from the originating `.partial` or `.finalized`); never
+    /// changed afterward — refinements update text only, and within-
+    /// utterance sibling rows from server-side `new paragraph` splits
+    /// always render on their own line regardless of this flag.
+    var startsNewParagraph: Bool
 }
 
 extension Array where Element == TranscriptRow {
@@ -50,6 +57,12 @@ extension Array where Element == TranscriptRow {
                     self[idx].text = p.text
                     self[idx].utteranceDuration = p.utteranceDuration
                     self[idx].inferenceDuration = p.inferenceDuration
+                    // Pipeline can clarify the paragraph status across
+                    // successive partials (e.g. silence threshold update);
+                    // partials don't change rows from a paragraph break to
+                    // continuation arbitrarily, but propagate whatever the
+                    // pipeline reports for consistency with finalized.
+                    self[idx].startsNewParagraph = p.startsNewParagraph
                 }
             } else {
                 insert(TranscriptRow(
@@ -58,18 +71,27 @@ extension Array where Element == TranscriptRow {
                     status: .partial,
                     text: p.text,
                     utteranceDuration: p.utteranceDuration,
-                    inferenceDuration: p.inferenceDuration
+                    inferenceDuration: p.inferenceDuration,
+                    startsNewParagraph: p.startsNewParagraph
                 ), at: 0)
             }
 
         case .finalized(let r):
+            // Preserve the paragraph flag from the existing row if one
+            // exists — the partial that created it already had the
+            // pipeline's verdict baked in, and `r.startsNewParagraph`
+            // should match anyway. If the row is being created fresh
+            // (partials disabled), use the value from the finalized event.
+            let inheritedFlag = firstIndex(where: { $0.utteranceID == utteranceID })
+                .map { self[$0].startsNewParagraph } ?? r.startsNewParagraph
             let row = TranscriptRow(
                 utteranceID: utteranceID,
                 segmentID: utteranceID,
                 status: .final(tokenCount: r.tokenCount, realTimeFactor: r.realTimeFactor, isRefined: false),
                 text: r.text,
                 utteranceDuration: r.utteranceDuration,
-                inferenceDuration: r.inferenceDuration
+                inferenceDuration: r.inferenceDuration,
+                startsNewParagraph: inheritedFlag
             )
             if let idx = firstIndex(where: { $0.utteranceID == utteranceID }) {
                 self[idx] = row
@@ -97,23 +119,36 @@ extension Array where Element == TranscriptRow {
             // whole utterance. We zero them on sibling rows so the
             // debug view doesn't duplicate the parent's numbers against
             // a paragraph that wasn't independently transcribed.
+            // Sibling rows from a server-side `new paragraph` split
+            // always render on their own line — set the flag so the
+            // renderer treats them as paragraph breaks even though
+            // they're not the first segment of the utterance.
             insert(TranscriptRow(
                 utteranceID: r.utteranceID,
                 segmentID: r.segmentID,
                 status: .final(tokenCount: 0, realTimeFactor: 0, isRefined: true),
                 text: r.text,
                 utteranceDuration: parent.utteranceDuration,
-                inferenceDuration: .zero
+                inferenceDuration: .zero,
+                startsNewParagraph: true
             ), at: parentIdx)
 
         case .failed(let f):
+            // Preserve the existing row's paragraph flag if there is one
+            // (failure replaces a partial); otherwise it's a brand new
+            // failure row and there's no prior context to inherit, so
+            // default false — the marker will inherit the flow of the
+            // prior paragraph.
+            let inheritedFlag = firstIndex(where: { $0.utteranceID == utteranceID })
+                .map { self[$0].startsNewParagraph } ?? false
             let row = TranscriptRow(
                 utteranceID: utteranceID,
                 segmentID: utteranceID,
                 status: .failed(message: f.message),
                 text: "",
                 utteranceDuration: f.utteranceDuration,
-                inferenceDuration: .zero
+                inferenceDuration: .zero,
+                startsNewParagraph: inheritedFlag
             )
             if let idx = firstIndex(where: { $0.utteranceID == utteranceID }) {
                 self[idx] = row
