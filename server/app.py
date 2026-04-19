@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import re
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -312,6 +313,32 @@ def _sse(event: str, payload: dict) -> bytes:
     return f"event: {event}\ndata: {json.dumps(payload)}\n\n".encode()
 
 
+def _mint_segment_ids(utterance_id: str, incoming_segment_id: str, n: int) -> list[str]:
+    """Deterministic segment ids for an n-paragraph split. Paragraph 0
+    reuses the client's `incoming_segment_id` so its stage events
+    overwrite the in-place row that was already rendered for the
+    finalized utterance. Paragraphs 1..n-1 get
+    `uuidv5(namespace=utterance_id, name=str(split_index))` — stable
+    across retries so the client's upsert doesn't accumulate orphan
+    rows on a retried stream. See v2 plan § Deterministic segment IDs."""
+    if n <= 0:
+        return []
+    ids = [incoming_segment_id]
+    if n == 1:
+        return ids
+    try:
+        namespace = uuid.UUID(utterance_id)
+    except (ValueError, TypeError):
+        # Caller handed us a non-UUID utterance id. Fall back to deriving
+        # the namespace from the raw string so we still produce stable,
+        # reproducible ids — just not ones a client could recompute from
+        # the UUID alone.
+        namespace = uuid.uuid5(uuid.NAMESPACE_URL, utterance_id)
+    for idx in range(1, n):
+        ids.append(str(uuid.uuid5(namespace, str(idx))))
+    return ids
+
+
 @app.post("/punctuate/stream")
 async def punctuate_stream(
     req: PunctuateStreamRequest,
@@ -333,10 +360,14 @@ async def punctuate_stream(
     as the *current* text for the given segment — each stage overwrites
     the prior stage's output for that segmentID.
 
-    Stateless: `segment_id` is echoed back verbatim. No new segment ids
-    are minted yet because splitting hasn't shipped; when it does, new
-    ids will be deterministic `uuidv5(utterance_id, split_index)` so
-    retries reproduce identical output.
+    Segment splitting: Stage 1 may split the utterance into multiple
+    paragraphs on `new paragraph` commands. Paragraph 0 reuses the
+    client's incoming `segment_id`; paragraphs 1..n-1 get deterministic
+    `uuidv5(utterance_id, split_index)` so retries reproduce identical
+    ids. Stages are emitted per-segment: `commands` for all segments
+    first, then `punct_case`, then `itn`. Only the very last event
+    (last segment's `itn`) carries `final: true` — clients use that as
+    the stream terminator regardless of segment count.
     """
     if len(req.text) > MAX_INPUT_CHARS:
         raise HTTPException(status_code=413, detail="input too long")
@@ -348,45 +379,66 @@ async def punctuate_stream(
 
     async def gen():
         try:
-            # Stage 1: spoken punctuation commands + ASR punct strip.
-            # Pure string ops, sub-millisecond — `to_thread` is overkill
-            # but keeps the yield-between-stages pattern uniform.
-            stage1_text = await asyncio.to_thread(apply_spoken_commands, req.text)
-            log.info("stream utter=%s stage=commands text=%r", utter_tag, stage1_text)
-            yield _sse("stage", {
-                "utterance_id": req.utterance_id,
-                "segment_id": req.segment_id,
-                "stage": "commands",
-                "text": stage1_text,
-                "final": False,
-            })
+            # Stage 1: spoken punctuation commands + ASR punct strip +
+            # paragraph splitting. Pure string ops, sub-millisecond —
+            # `to_thread` is overkill but keeps the yield-between-stages
+            # pattern uniform. Returns a list of one or more paragraphs.
+            paragraphs = await asyncio.to_thread(apply_spoken_commands, req.text)
+            segment_ids = _mint_segment_ids(
+                req.utterance_id, req.segment_id, len(paragraphs)
+            )
+            log.info(
+                "stream utter=%s stage=commands segments=%d texts=%r",
+                utter_tag, len(paragraphs), paragraphs,
+            )
+            for seg_id, para in zip(segment_ids, paragraphs):
+                yield _sse("stage", {
+                    "utterance_id": req.utterance_id,
+                    "segment_id": seg_id,
+                    "stage": "commands",
+                    "text": para,
+                    "final": False,
+                })
 
-            # Stage 2: punct + case. Blocking ONNX call → asyncio.to_thread
-            # so the event loop can flush this stage's bytes before Stage 3
-            # starts. Without offloading, the whole response would arrive
-            # together at EOF, defeating the streaming.
-            refined = await asyncio.to_thread(_run_v1_pipeline, stage1_text)
-            log.info("stream utter=%s stage=punct_case text=%r", utter_tag, refined)
-            yield _sse("stage", {
-                "utterance_id": req.utterance_id,
-                "segment_id": req.segment_id,
-                "stage": "punct_case",
-                "text": refined,
-                "final": False,
-            })
+            # Stage 2: punct + case per paragraph. Blocking ONNX call →
+            # asyncio.to_thread so the event loop can flush bytes between
+            # segments. Without offloading, the whole response would
+            # arrive together at EOF, defeating the streaming.
+            refined_segs: list[str] = []
+            for seg_id, para in zip(segment_ids, paragraphs):
+                refined = await asyncio.to_thread(_run_v1_pipeline, para)
+                refined_segs.append(refined)
+                log.info(
+                    "stream utter=%s seg=%s stage=punct_case text=%r",
+                    utter_tag, seg_id[:8], refined,
+                )
+                yield _sse("stage", {
+                    "utterance_id": req.utterance_id,
+                    "segment_id": seg_id,
+                    "stage": "punct_case",
+                    "text": refined,
+                    "final": False,
+                })
 
-            # Stage 3: ITN. Pynini's WFST traversal is fast (~1-5 ms for
-            # typical utterances) but still CPU-bound; offload so it doesn't
-            # block the event loop for concurrent streams.
-            normalized = await asyncio.to_thread(_stage_itn, refined)
-            log.info("stream utter=%s stage=itn text=%r", utter_tag, normalized)
-            yield _sse("stage", {
-                "utterance_id": req.utterance_id,
-                "segment_id": req.segment_id,
-                "stage": "itn",
-                "text": normalized,
-                "final": True,
-            })
+            # Stage 3: ITN per paragraph. Pynini's WFST traversal is fast
+            # (~1-5 ms for typical utterances) but still CPU-bound;
+            # offload so it doesn't block the event loop for concurrent
+            # streams. Only the last segment's itn is the stream
+            # terminator (`final: true`).
+            last_idx = len(segment_ids) - 1
+            for idx, (seg_id, refined) in enumerate(zip(segment_ids, refined_segs)):
+                normalized = await asyncio.to_thread(_stage_itn, refined)
+                log.info(
+                    "stream utter=%s seg=%s stage=itn text=%r",
+                    utter_tag, seg_id[:8], normalized,
+                )
+                yield _sse("stage", {
+                    "utterance_id": req.utterance_id,
+                    "segment_id": seg_id,
+                    "stage": "itn",
+                    "text": normalized,
+                    "final": idx == last_idx,
+                })
         except Exception as e:
             log.exception("stream pipeline failed")
             yield _sse("error", {"message": str(e)})
